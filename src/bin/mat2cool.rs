@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use cooler::{Chrom, CoolerWriter, Pixel};
+use cooler_rs::{Chrom, CoolerWriter, Pixel};
 
 #[derive(Parser)]
 #[command(

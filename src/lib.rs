@@ -8,9 +8,9 @@
 //! # Writing a `.cool` file
 //!
 //! ```no_run
-//! use cooler::{Chrom, CoolerWriter, Pixel};
+//! use cooler_rs::{Chrom, CoolerWriter, Pixel};
 //!
-//! # fn main() -> cooler::Result<()> {
+//! # fn main() -> cooler_rs::Result<()> {
 //! let chroms = vec![
 //!     Chrom { name: "chr1".into(), length: 1_000_000 },
 //!     Chrom { name: "chr2".into(), length: 500_000 },
@@ -24,9 +24,9 @@
 //! # Reading an `.mcool` file
 //!
 //! ```no_run
-//! use cooler::Mcool;
+//! use cooler_rs::Mcool;
 //!
-//! # fn main() -> cooler::Result<()> {
+//! # fn main() -> cooler_rs::Result<()> {
 //! let mcool = Mcool::open("out.mcool")?;
 //! for res in mcool.resolutions()? {
 //!     let cool = mcool.cooler(res)?;

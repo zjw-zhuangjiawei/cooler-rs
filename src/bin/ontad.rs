@@ -5,28 +5,28 @@
 //! N×N text matrix to `.cool` first.)
 //!
 //! Usage:
-//!   ontad <input.cool|input.mcool> [options]
+//!   `ontad <input.cool|input.mcool> [options]`
 //!
 //! Options:
-//!   -penalty <f>   penalty for adding a TAD (default 0.1)
-//!   -maxsz <n>     maximum TAD size in bins (default 200)
-//!   -minsz <n>     minimum TAD size in bins (default 3)
-//!   -lsize <n>     local-minimum window half-size (default 5)
-//!   -ldiff <f>     local-minimum threshold in stddevs (default 1.96)
-//!   -log2          apply log2(x + 1) to the matrix
-//!   -shuffle       shuffle each diagonal (null model)
-//!   -o <prefix>    output prefix (default: input file name)
-//!   -bedout <chr> <chrlength> <resolution>
+//!   `-penalty <f>`   penalty for adding a TAD (default 0.1)
+//!   `-maxsz <n>`     maximum TAD size in bins (default 200)
+//!   `-minsz <n>`     minimum TAD size in bins (default 3)
+//!   `-lsize <n>`     local-minimum window half-size (default 5)
+//!   `-ldiff <f>`     local-minimum threshold in stddevs (default 1.96)
+//!   `-log2`          apply log2(x + 1) to the matrix
+//!   `-shuffle`       shuffle each diagonal (null model)
+//!   `-o <prefix>`    output prefix (default: input file name)
+//!   `-bedout <chr> <chrlength> <resolution>`
 //!                  also write a .bed file (overrides file metadata)
-//!   -chr <name>    chromosome to extract (.cool/.mcool input)
-//!   -res <n>       resolution to use (.mcool input)
+//!   `-chr <name>`    chromosome to extract (.cool/.mcool input)
+//!   `-res <n>`       resolution to use (.mcool input)
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use cooler::ontad::{self, Params};
-use cooler::{Cooler, ChromMeta, Mcool};
+use cooler_rs::ontad::{self, Params};
+use cooler_rs::{Cooler, ChromMeta, Mcool};
 
 /// Known flags from the original OnTAD CLI (single-dash prefix).
 /// These are rewritten to GNU-style `--flag` for clap compatibility.
@@ -107,7 +107,7 @@ struct Args {
     #[arg(short = 'o', long, value_name = "PREFIX")]
     output: Option<String>,
 
-    /// Also write a .bed file: <CHR> <CHRLENGTH> <RESOLUTION>
+    /// Also write a .bed file: `CHR CHRLENGTH RESOLUTION`
     #[arg(
         short = 'b',
         long = "bedout",

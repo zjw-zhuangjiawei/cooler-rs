@@ -6,7 +6,7 @@ plus Hi-C analysis command-line tools.
 
 ## Features
 
-- **Library**: `cooler::Cooler` / `cooler::Mcool` read and write single-resolution
+- **Library**: `cooler_rs::Cooler` / `cooler_rs::Mcool` read and write single-resolution
   `.cool` and multi-resolution `.mcool` files following the cooler schema
   (bin table, sparse pixel matrix, chromosome offsets).
 - **OnTAD**: hierarchical TAD calling (port of [OnTAD v1.4](https://github.com/zhanglabtools/OnTAD)).
@@ -19,7 +19,7 @@ plus Hi-C analysis command-line tools.
 Write a `.cool`:
 
 ```rust
-use cooler::{Chrom, CoolerWriter, Pixel};
+use cooler_rs::{Chrom, CoolerWriter, Pixel};
 
 let chroms = vec![
     Chrom { name: "chr1".into(), length: 1_000_000 },
@@ -32,7 +32,7 @@ writer.write_pixels(&[Pixel { bin1_id: 0, bin2_id: 3, count: 42.0 }])?;
 Read an `.mcool`:
 
 ```rust
-use cooler::Mcool;
+use cooler_rs::Mcool;
 
 let mcool = Mcool::open("out.mcool")?;
 for res in mcool.resolutions()? {

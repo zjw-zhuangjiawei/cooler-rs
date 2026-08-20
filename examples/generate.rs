@@ -10,7 +10,7 @@
 //! Writes `<prefix>.cool` (single resolution) and `<prefix>.mcool`
 //! (three resolutions). Default prefix: `sample`.
 
-use cooler::{Chrom, CoolerWriter, McoolWriter, Pixel};
+use cooler_rs::{Chrom, CoolerWriter, McoolWriter, Pixel};
 
 /// Toy interaction blocks for one chromosome: strong signal inside each
 /// TAD, weak background elsewhere. Upper triangle only — cooler stores a
@@ -53,7 +53,7 @@ fn chroms() -> Vec<Chrom> {
     ]
 }
 
-fn main() -> cooler::Result<()> {
+fn main() -> cooler_rs::Result<()> {
     let prefix = std::env::args().nth(1).unwrap_or_else(|| "sample".into());
     let chroms = chroms();
 

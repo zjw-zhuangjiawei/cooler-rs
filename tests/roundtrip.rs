@@ -1,6 +1,6 @@
 //! Round-trip tests for `.cool` and `.mcool` files.
 
-use cooler::{Chrom, Cooler, CoolerWriter, Mcool, McoolWriter, Pixel};
+use cooler_rs::{Chrom, Cooler, CoolerWriter, Mcool, McoolWriter, Pixel};
 
 fn test_chroms() -> Vec<Chrom> {
     vec![
@@ -109,7 +109,7 @@ fn writer_rejects_out_of_range_pixels() {
             count: 1.0,
         }])
         .unwrap_err();
-    assert!(matches!(err, cooler::Error::InvalidInput(_)));
+    assert!(matches!(err, cooler_rs::Error::InvalidInput(_)));
 }
 
 #[test]
@@ -162,14 +162,14 @@ fn opening_wrong_format_fails() {
 
     // Mcool should still reject a plain file (missing format attribute).
     let mcool_err = Mcool::open(&path).err().expect("expected format error");
-    assert!(matches!(mcool_err, cooler::Error::Format(_)));
+    assert!(matches!(mcool_err, cooler_rs::Error::Format(_)));
 
     // Cooler::open is now lenient (old files may lack the format attribute),
     // but reading data from a plain HDF5 file should fail.
     let cool = Cooler::open(&path).expect("open should succeed (lenient format check)");
     let chroms_err = cool.chroms().err().expect("expected chroms read error");
     assert!(
-        matches!(chroms_err, cooler::Error::Hdf5(_)),
+        matches!(chroms_err, cooler_rs::Error::Hdf5(_)),
         "expected Hdf5 error, got {chroms_err:?}"
     );
 }

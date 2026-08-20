@@ -1,9 +1,14 @@
 [package]
-name = "cooler"
+name = "cooler-rs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "A Rust library for cooler"
+authors = ["Zhuang Jiawei <zjw@stu.scau.edu.cn>"]
+description = "Read/write .cool and .mcool Hi-C contact matrix files (HDF5) plus Hi-C analysis CLIs (OnTAD, mat2cool)"
+repository = "https://github.com/zjw-zhuangjiawei/cooler-rs"
+readme = "README.md"
+keywords = ["cooler", "hic", "hdf5", "tad", "genomics"]
+categories = ["science"]
 
 [dependencies]
 hdf5-metno = { version = "0.14.0", features = ["static", "zlib"] }

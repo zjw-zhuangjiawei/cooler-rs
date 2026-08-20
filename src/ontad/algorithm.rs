@@ -7,7 +7,7 @@ use crate::types::ChromMeta;
 use super::{Params, Tad};
 
 /// Extract a single-chromosome matrix from a cooler collection, keeping
-/// only the band `|bin2 - bin1| <= band` (like [`load_matrix`]).
+/// only the band `|bin2 - bin1| <= band` (like `load_matrix`).
 ///
 /// `chr` selects the chromosome by name; it may be omitted when the file
 /// contains exactly one chromosome.
