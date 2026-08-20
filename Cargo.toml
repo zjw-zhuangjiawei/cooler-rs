@@ -1,0 +1,17 @@
+[package]
+name = "cooler"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A Rust library for cooler"
+
+[dependencies]
+hdf5-metno = { version = "0.14.0", features = ["static", "zlib"] }
+ndarray = "0.17"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+tempfile = "3.27.0"
