@@ -2,15 +2,18 @@
 
 A Rust implementation of the [cooler](https://cooler.readthedocs.io/en/latest/schema.html)
 file format — read/write for `.cool` and `.mcool` Hi-C contact matrices (HDF5) —
-plus Hi-C analysis command-line tools.
+plus the `cooler-rs` command-line tool for Hi-C analysis.
 
 ## Features
 
 - **Library**: `cooler_rs::Cooler` / `cooler_rs::Mcool` read and write single-resolution
   `.cool` and multi-resolution `.mcool` files following the cooler schema
   (bin table, sparse pixel matrix, chromosome offsets).
-- **OnTAD**: hierarchical TAD calling (port of [OnTAD v1.4](https://github.com/zhanglabtools/OnTAD)).
-- **mat2cool**: convert a dense N×N text matrix to `.cool`.
+- **CLI**: a single `cooler-rs` binary:
+  - `cooler-rs call-tad` — hierarchical TAD calling (`--method ontad`, a port of
+    [OnTAD v1.4](https://github.com/anlin00007/OnTAD)).
+  - `cooler-rs convert` — format conversion (e.g. `--from dense-txt`, a dense
+    N×N text matrix to `.cool`).
 
 ## Usage
 
@@ -48,11 +51,13 @@ for res in mcool.resolutions()? {
 cargo run --example generate /tmp/toy
 
 # OnTAD hierarchical TAD calling
-cargo run --release --bin ontad /tmp/toy.cool --chr chr1 -o out
+cargo run --release -- call-tad /tmp/toy.cool --method ontad --chr chr1 -o out
 
 # Dense matrix -> .cool
-cargo run --release --bin mat2cool matrix.txt -o out.cool -L 250000000 -r 100000
+cargo run --release -- convert --from dense-txt matrix.txt -o out.cool -L 250000000 -r 100000
 ```
+
+Run `cooler-rs <COMMAND> --help` for the full option list of each subcommand.
 
 ### Examples
 

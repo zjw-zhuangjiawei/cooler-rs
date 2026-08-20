@@ -36,6 +36,7 @@
 //! # }
 //! ```
 
+pub mod convert;
 pub mod cooler;
 pub mod error;
 pub mod mcool;

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Zhuang Jiawei <zjw@stu.scau.edu.cn>"]
-description = "Read/write .cool and .mcool Hi-C contact matrix files (HDF5) plus Hi-C analysis CLIs (OnTAD, mat2cool)"
+description = "Read/write .cool and .mcool Hi-C contact matrix files (HDF5), plus the cooler-rs CLI (TAD calling, format conversion)"
 repository = "https://github.com/zjw-zhuangjiawei/cooler-rs"
 readme = "README.md"
 keywords = ["cooler", "hic", "hdf5", "tad", "genomics"]
@@ -17,6 +17,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
+rand = "0.9"
 
 [dev-dependencies]
 tempfile = "3.27.0"
