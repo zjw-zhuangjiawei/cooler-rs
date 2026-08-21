@@ -70,11 +70,31 @@ mod tests {
         assert_eq!(
             pixels,
             vec![
-                Pixel { bin1_id: 0, bin2_id: 0, count: 1.0 },
-                Pixel { bin1_id: 0, bin2_id: 2, count: 2.0 },
-                Pixel { bin1_id: 1, bin2_id: 1, count: 4.0 },
-                Pixel { bin1_id: 1, bin2_id: 2, count: 5.0 },
-                Pixel { bin1_id: 2, bin2_id: 2, count: 7.0 },
+                Pixel {
+                    bin1_id: 0,
+                    bin2_id: 0,
+                    count: 1.0
+                },
+                Pixel {
+                    bin1_id: 0,
+                    bin2_id: 2,
+                    count: 2.0
+                },
+                Pixel {
+                    bin1_id: 1,
+                    bin2_id: 1,
+                    count: 4.0
+                },
+                Pixel {
+                    bin1_id: 1,
+                    bin2_id: 2,
+                    count: 5.0
+                },
+                Pixel {
+                    bin1_id: 2,
+                    bin2_id: 2,
+                    count: 7.0
+                },
             ]
         );
     }
@@ -86,9 +106,21 @@ mod tests {
         assert_eq!(
             pixels,
             vec![
-                Pixel { bin1_id: 0, bin2_id: 0, count: 1.0 },
-                Pixel { bin1_id: 0, bin2_id: 1, count: 2.0 },
-                Pixel { bin1_id: 1, bin2_id: 1, count: 4.0 },
+                Pixel {
+                    bin1_id: 0,
+                    bin2_id: 0,
+                    count: 1.0
+                },
+                Pixel {
+                    bin1_id: 0,
+                    bin2_id: 1,
+                    count: 2.0
+                },
+                Pixel {
+                    bin1_id: 1,
+                    bin2_id: 1,
+                    count: 4.0
+                },
             ]
         );
     }

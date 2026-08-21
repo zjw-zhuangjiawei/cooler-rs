@@ -11,7 +11,9 @@
 mod algorithm;
 mod output;
 
-pub use algorithm::{cal_mins, call_tads, cumsum, get_score, hicnorm, matrix_from_cooler, set_pair};
+pub use algorithm::{
+    cal_mins, call_tads, cumsum, get_score, hicnorm, matrix_from_cooler, set_pair,
+};
 pub use output::{write_bed, write_tad};
 
 /// Parameters controlling TAD calling (defaults match OnTAD v1.4).

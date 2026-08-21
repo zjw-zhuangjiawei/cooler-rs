@@ -38,14 +38,16 @@
 
 pub mod convert;
 pub mod cooler;
+pub mod domaincaller;
 pub mod error;
 pub mod mcool;
 pub mod ontad;
+pub mod stats;
 pub mod types;
 
 pub use cooler::{Cooler, CoolerWriter};
 pub use error::{Error, Result};
 pub use mcool::{Mcool, McoolWriter};
 pub use ontad::{Params, Tad};
-pub use types::ChromMeta;
-pub use types::{Bin, Chrom, Pixel};
+pub use stats::{DiscreteDistribution, GeneralMixtureModel, HiddenMarkovModel, NormalDistribution};
+pub use types::{Bin, Chrom, ChromMeta, Pixel};

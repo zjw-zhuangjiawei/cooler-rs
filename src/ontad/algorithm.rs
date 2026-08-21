@@ -18,19 +18,16 @@ pub fn matrix_from_cooler(
 ) -> Result<(Array2<f64>, ChromMeta)> {
     let chroms = cool.chroms()?;
     let chrom_id = match chr {
-        Some(name) => chroms
-            .iter()
-            .position(|c| c.name == name)
-            .ok_or_else(|| {
-                let available = chroms
-                    .iter()
-                    .map(|c| c.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Error::InvalidInput(format!(
-                    "chromosome '{name}' not found (available: {available})"
-                ))
-            })?,
+        Some(name) => chroms.iter().position(|c| c.name == name).ok_or_else(|| {
+            let available = chroms
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Error::InvalidInput(format!(
+                "chromosome '{name}' not found (available: {available})"
+            ))
+        })?,
         None if chroms.len() == 1 => 0,
         None => {
             let available = chroms
@@ -64,16 +61,14 @@ pub fn matrix_from_cooler(
     let meta = ChromMeta {
         name: chrom.name.clone(),
         length: chrom.length as u64,
-        resolution: cool.bin_size()?.ok_or_else(|| {
-            Error::Format("missing 'bin-size' attribute".into())
-        })?,
+        resolution: cool
+            .bin_size()?
+            .ok_or_else(|| Error::Format("missing 'bin-size' attribute".into()))?,
     };
     Ok((x, meta))
 }
 
-// ---------------------------------------------------------------------------
 // Step 2: corner score and candidate boundaries
-// ---------------------------------------------------------------------------
 
 /// 2D prefix sums: `sx[i][j]` = sum of `x[0..=i][0..=j]`.
 pub fn cumsum(x: ArrayView2<'_, f64>) -> Array2<f64> {
@@ -192,9 +187,7 @@ pub fn set_pair(lm: ArrayView2<'_, bool>) -> Array2<bool> {
     sel
 }
 
-// ---------------------------------------------------------------------------
 // Step 3: remove distance effect
-// ---------------------------------------------------------------------------
 
 /// Standardize each diagonal of the (symmetric) matrix in place
 /// (C++ `HiCnorm`, called there with `band = maxsz * 2`).
@@ -223,9 +216,7 @@ pub fn hicnorm(x: &mut ArrayViewMut2<'_, f64>, band: usize) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Step 4: dynamic programming
-// ---------------------------------------------------------------------------
 
 /// Memoization tables shared by the recursive DP (the C++ globals `S`, `M`, `B`).
 struct DpTables {
@@ -300,7 +291,18 @@ fn dpcall(
                 let ts = if j == 0 && i == l - 1 {
                     0.0
                 } else {
-                    dpcall(x, sx, st + j, st + i + 1, minsz, maxsz, penalty, sel, tables).0
+                    dpcall(
+                        x,
+                        sx,
+                        st + j,
+                        st + i + 1,
+                        minsz,
+                        maxsz,
+                        penalty,
+                        sel,
+                        tables,
+                    )
+                    .0
                 };
                 tscore[j] = Some(ts);
                 if j > 0 {

@@ -48,8 +48,14 @@ fn all_pixels(chroms: &[Chrom], res: u32) -> Vec<Pixel> {
 /// Small synthetic chromosomes so the whole example runs in milliseconds.
 fn chroms() -> Vec<Chrom> {
     vec![
-        Chrom { name: "chr1".into(), length: 2_000_000 },
-        Chrom { name: "chr2".into(), length: 1_000_000 },
+        Chrom {
+            name: "chr1".into(),
+            length: 2_000_000,
+        },
+        Chrom {
+            name: "chr2".into(),
+            length: 1_000_000,
+        },
     ]
 }
 

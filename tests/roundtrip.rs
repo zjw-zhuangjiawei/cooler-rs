@@ -167,7 +167,7 @@ fn opening_wrong_format_fails() {
     // Cooler::open is now lenient (old files may lack the format attribute),
     // but reading data from a plain HDF5 file should fail.
     let cool = Cooler::open(&path).expect("open should succeed (lenient format check)");
-    let chroms_err = cool.chroms().err().expect("expected chroms read error");
+    let chroms_err = cool.chroms().expect_err("expected chroms read error");
     assert!(
         matches!(chroms_err, cooler_rs::Error::Hdf5(_)),
         "expected Hdf5 error, got {chroms_err:?}"

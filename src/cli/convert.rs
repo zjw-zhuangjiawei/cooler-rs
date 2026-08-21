@@ -88,9 +88,8 @@ pub fn run(args: ConvertArgs) -> cooler_rs::Result<()> {
 
 /// Convert a dense N×N text matrix to a single-chromosome `.cool` file.
 fn dense_txt_to_cool(args: &ConvertArgs) -> cooler_rs::Result<()> {
-    let text = std::fs::read_to_string(&args.input).map_err(|e| {
-        Error::InvalidInput(format!("cannot read '{}': {e}", args.input.display()))
-    })?;
+    let text = std::fs::read_to_string(&args.input)
+        .map_err(|e| Error::InvalidInput(format!("cannot read '{}': {e}", args.input.display())))?;
 
     let (n, pixels) = cooler_rs::convert::dense_txt_to_pixels(&text)?;
     if pixels.is_empty() {

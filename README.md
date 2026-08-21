@@ -50,8 +50,11 @@ for res in mcool.resolutions()? {
 # Generate toy Hi-C data (for testing downstream tools)
 cargo run --example generate /tmp/toy
 
-# OnTAD hierarchical TAD calling
+# Hierarchical TAD calling (OnTAD, default)
 cargo run --release -- call-tad /tmp/toy.cool --method ontad --chr chr1 -o out
+
+# DomainCaller TAD calling (TADLib port; writes .domains + .DIs.bedGraph)
+cargo run --release -- call-tad /tmp/toy.cool --method domaincaller --chr chr1 -o out
 
 # Dense matrix -> .cool
 cargo run --release -- convert --from dense-txt matrix.txt -o out.cool -L 250000000 -r 100000
@@ -80,6 +83,8 @@ link statically without a system HDF5.
 | `cooler`          | `.cool` reading / writing           |
 | `mcool`           | `.mcool` multi-resolution container |
 | `ontad`           | OnTAD hierarchical TAD algorithm    |
+| `domaincaller`    | TADLib DomainCaller port (Dixon et al., 2012) |
+| `stats`           | pomegranate 0.10.0 port: GMM / HMM / normal / discrete |
 | `error` / `types` | error type and shared structs       |
 
 ## License

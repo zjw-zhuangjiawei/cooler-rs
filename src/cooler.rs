@@ -140,8 +140,8 @@ impl CoolerWriter {
         let mut chrom_offset: Vec<i64> = Vec::with_capacity(chroms.len() + 1);
         chrom_offset.push(0);
         for (chrom_id, chrom) in chroms.iter().enumerate() {
-            let n = ((i64::from(chrom.length) + i64::from(bin_size) - 1)
-                / i64::from(bin_size)) as i32;
+            let n =
+                ((i64::from(chrom.length) + i64::from(bin_size) - 1) / i64::from(bin_size)) as i32;
             for i in 0..n {
                 let start = i * bin_size as i32;
                 bin_chrom.push(chrom_id as i32);
@@ -272,15 +272,12 @@ impl Cooler {
     /// the standard layout first, then searches for numeric subgroups
     /// that contain a `chroms` table.
     pub fn open_any<P: AsRef<Path>>(path: P) -> Result<Self> {
-        // Try standard format first.
-        match Self::open(path.as_ref()) {
-            Ok(cooler) => {
-                // Verify the root actually has chroms data; if not, fall through.
-                if cooler.group.link_exists("chroms") {
-                    return Ok(cooler);
-                }
+        // Try standard format first; fall through if the root has no
+        // chroms data.
+        if let Ok(cooler) = Self::open(path.as_ref()) {
+            if cooler.group.link_exists("chroms") {
+                return Ok(cooler);
             }
-            Err(_) => {}
         }
 
         // Search for a numeric-named subgroup containing chroms.
@@ -311,10 +308,7 @@ impl Cooler {
     /// Wrap an existing HDF5 group (e.g. `/resolutions/10000` in an `.mcool`
     /// file) as a cooler collection.
     pub fn from_group(group: Group) -> Result<Self> {
-        let cooler = Cooler {
-            group,
-            _file: None,
-        };
+        let cooler = Cooler { group, _file: None };
         cooler.check_format()?;
         Ok(cooler)
     }
@@ -381,10 +375,7 @@ impl Cooler {
             ($n:expr) => {{
                 use hdf5_metno::types::FixedAscii;
                 let values: Vec<FixedAscii<$n>> = ds.read_1d()?.to_vec();
-                values
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
+                values.iter().map(|v| v.to_string()).collect::<Vec<_>>()
             }};
         }
 
@@ -528,10 +519,7 @@ impl Cooler {
         Ok(all
             .into_iter()
             .filter(|n| {
-                n.starts_with("bins/")
-                    && n != "bins/chrom"
-                    && n != "bins/start"
-                    && n != "bins/end"
+                n.starts_with("bins/") && n != "bins/chrom" && n != "bins/start" && n != "bins/end"
             })
             .map(|n| n.strip_prefix("bins/").unwrap().to_string())
             .collect())
@@ -557,11 +545,19 @@ impl Cooler {
 
     /// Read the `/indexes/bin1_offset` table.
     pub fn bin1_offset(&self) -> Result<Vec<i64>> {
-        Ok(self.group.dataset("indexes/bin1_offset")?.read_1d()?.to_vec())
+        Ok(self
+            .group
+            .dataset("indexes/bin1_offset")?
+            .read_1d()?
+            .to_vec())
     }
 
     /// Read the `/indexes/chrom_offset` table.
     pub fn chrom_offset(&self) -> Result<Vec<i64>> {
-        Ok(self.group.dataset("indexes/chrom_offset")?.read_1d()?.to_vec())
+        Ok(self
+            .group
+            .dataset("indexes/chrom_offset")?
+            .read_1d()?
+            .to_vec())
     }
 }

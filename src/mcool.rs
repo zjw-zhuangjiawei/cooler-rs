@@ -32,13 +32,21 @@ impl McoolWriter {
         let root = file.group("/")?;
         root.new_attr::<hdf5_metno::types::VarLenUnicode>()
             .create("format")?
-            .write_scalar(&MCOOL_FORMAT.parse::<hdf5_metno::types::VarLenUnicode>().expect("valid UTF-8"))?;
+            .write_scalar(
+                &MCOOL_FORMAT
+                    .parse::<hdf5_metno::types::VarLenUnicode>()
+                    .expect("valid UTF-8"),
+            )?;
         root.new_attr::<i64>()
             .create("format-version")?
             .write_scalar(&MCOOL_FORMAT_VERSION)?;
         root.new_attr::<hdf5_metno::types::VarLenUnicode>()
             .create("bin-type")?
-            .write_scalar(&"fixed".parse::<hdf5_metno::types::VarLenUnicode>().expect("valid UTF-8"))?;
+            .write_scalar(
+                &"fixed"
+                    .parse::<hdf5_metno::types::VarLenUnicode>()
+                    .expect("valid UTF-8"),
+            )?;
 
         file.create_group(RESOLUTIONS_GROUP)?;
         Ok(McoolWriter { file })
@@ -91,9 +99,9 @@ impl Mcool {
         let group = self.file.group(RESOLUTIONS_GROUP)?;
         let mut resolutions = Vec::new();
         for name in group.member_names()? {
-            let res: u64 = name.parse().map_err(|_| {
-                Error::Format(format!("non-numeric resolution group '{name}'"))
-            })?;
+            let res: u64 = name
+                .parse()
+                .map_err(|_| Error::Format(format!("non-numeric resolution group '{name}'")))?;
             resolutions.push(res);
         }
         resolutions.sort_unstable();
@@ -103,9 +111,10 @@ impl Mcool {
     /// Open the cooler collection for a given resolution.
     pub fn cooler(&self, bin_size: u64) -> Result<Cooler> {
         let path = format!("{RESOLUTIONS_GROUP}/{bin_size}");
-        let group = self.file.group(&path).map_err(|_| {
-            Error::Format(format!("resolution {bin_size} not found"))
-        })?;
+        let group = self
+            .file
+            .group(&path)
+            .map_err(|_| Error::Format(format!("resolution {bin_size} not found")))?;
         Cooler::from_group(group)
     }
 }
