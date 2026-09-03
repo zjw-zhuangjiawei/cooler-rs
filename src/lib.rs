@@ -36,6 +36,7 @@
 //! # }
 //! ```
 
+pub mod armatus;
 pub mod balance;
 pub mod convert;
 pub mod cooler;
@@ -47,6 +48,7 @@ pub mod region;
 pub mod stats;
 pub mod types;
 
+pub use armatus::{call_domains, Domain};
 pub use balance::{balance_cooler, BalanceParams, BalanceStats};
 pub use cooler::{
     delete_bins_column, rename_chroms, write_bins_column, AttrValue, Cooler, CoolerWriter,

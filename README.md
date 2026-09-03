@@ -11,7 +11,9 @@ plus the `cooler-rs` command-line tool for Hi-C analysis.
   (bin table, sparse pixel matrix, chromosome offsets).
 - **CLI**: a single `cooler-rs` binary:
   - `cooler-rs call-tad` — hierarchical TAD calling (`--method ontad`, a port of
-    [OnTAD v1.4](https://github.com/anlin00007/OnTAD)).
+    [OnTAD v1.4](https://github.com/anlin00007/OnTAD); `--method domaincaller`,
+    a TADLib port; `--method armatus`, an
+    [Armatus 2.3](https://github.com/kingsfordgroup/armatus) port).
   - `cooler-rs convert` — format conversion (e.g. `--from dense-txt`, a dense
     N×N text matrix to `.cool`).
   - `cooler-rs balance` — out-of-core matrix balancing / iterative correction
@@ -60,6 +62,9 @@ cargo run --release -- call-tad /tmp/toy.cool --method ontad --chr chr1 -o out
 # DomainCaller TAD calling (TADLib port; writes .domains + .DIs.bedGraph)
 cargo run --release -- call-tad /tmp/toy.cool --method domaincaller --chr chr1 -o out
 
+# Armatus TAD calling (multiresolution; writes .consensus.txt)
+cargo run --release -- call-tad /tmp/toy.cool --method armatus --chr chr1 --gamma 0.5 -o out
+
 # Dense matrix -> .cool
 cargo run --release -- convert --from dense-txt matrix.txt -o out.cool -L 250000000 -r 100000
 
@@ -91,6 +96,7 @@ link statically without a system HDF5.
 | `mcool`           | `.mcool` multi-resolution container |
 | `ontad`           | OnTAD hierarchical TAD algorithm    |
 | `domaincaller`    | TADLib DomainCaller port (Dixon et al., 2012) |
+| `armatus`         | Armatus 2.3 multiresolution TAD port (Filippova et al., 2014) |
 | `stats`           | pomegranate 0.10.0 port: GMM / HMM / normal / discrete |
 | `error` / `types` | error type and shared structs       |
 

@@ -13,6 +13,7 @@ use std::time::Instant;
 use clap::{Args, ValueEnum};
 use rand::Rng;
 
+use cooler_rs::armatus;
 use cooler_rs::domaincaller::Chrom;
 use cooler_rs::ontad::{self, Params};
 use cooler_rs::{ChromMeta, Cooler, Error, Mcool};
@@ -24,6 +25,8 @@ pub enum TadMethod {
     Ontad,
     /// DomainCaller (Dixon et al., Nature 2012; Rust port of TADLib)
     Domaincaller,
+    /// Armatus 2.3 (Filippova et al., Algorithms Mol Biol 2014; Rust port)
+    Armatus,
 }
 
 #[derive(Args)]
@@ -54,6 +57,9 @@ pub struct CallTadArgs {
 
     #[command(flatten)]
     ontad: OntadOptions,
+
+    #[command(flatten)]
+    armatus: ArmatusOptions,
 }
 
 /// Options specific to `--method ontad`.
@@ -103,6 +109,50 @@ impl OntadOptions {
     }
 }
 
+/// Options specific to `--method armatus`.
+#[derive(Args)]
+struct ArmatusOptions {
+    /// Highest gamma (resolution) to generate domains at
+    #[arg(long, value_name = "G", help_heading = "Armatus options")]
+    gamma: Option<f64>,
+
+    /// Step size between resolutions
+    #[arg(long, value_name = "S", help_heading = "Armatus options")]
+    step: Option<f64>,
+
+    /// Number of near-optimal solutions per resolution
+    #[arg(long, value_name = "K", help_heading = "Armatus options")]
+    top_k: Option<usize>,
+
+    /// Minimum samples required to compute a per-size mean
+    #[arg(long, value_name = "N", help_heading = "Armatus options")]
+    min_mean_samples: Option<usize>,
+
+    /// Only generate domains at the maximum gamma
+    #[arg(long, help_heading = "Armatus options")]
+    just_gamma_max: bool,
+
+    /// Also write per-resolution domain files
+    #[arg(long, help_heading = "Armatus options")]
+    multiscale: bool,
+
+    /// Apply natural log to positive counts (Armatus sparse/Rao semantics)
+    #[arg(long, help_heading = "Armatus options")]
+    log: bool,
+}
+
+impl ArmatusOptions {
+    fn params(&self) -> armatus::Params {
+        armatus::Params {
+            gamma_max: self.gamma.unwrap_or(0.5),
+            step_size: self.step.unwrap_or(0.05),
+            top_k: self.top_k.unwrap_or(1),
+            min_mean_samples: self.min_mean_samples.unwrap_or(100),
+            just_gamma_max: self.just_gamma_max,
+        }
+    }
+}
+
 pub fn run(args: CallTadArgs) -> cooler_rs::Result<()> {
     let fin = args.input.display().to_string();
 
@@ -115,6 +165,7 @@ pub fn run(args: CallTadArgs) -> cooler_rs::Result<()> {
     match args.method {
         TadMethod::Ontad => run_ontad(&args, &fin),
         TadMethod::Domaincaller => run_domaincaller(&args, &fin),
+        TadMethod::Armatus => run_armatus(&args, &fin),
     }
 }
 
@@ -241,6 +292,80 @@ fn run_domaincaller(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     }
     log::info!(" Output to {fdom}, {fdi}");
     log::info!("Total run time: {:.1?}", t0.elapsed());
+    Ok(())
+}
+
+fn run_armatus(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
+    let params = args.armatus.params();
+    log::info!(
+        "Armatus 2.3 (Rust port): gamma_max={}, step={}, top_k={}, min_mean_samples={}",
+        params.gamma_max,
+        params.step_size,
+        params.top_k,
+        params.min_mean_samples
+    );
+    let t0 = Instant::now();
+
+    let (cool, first, last, meta) = open_cooler(args, fin)?;
+    let res = meta.resolution as usize;
+    let n = last - first;
+
+    // Full symmetric dense matrix (Armatus sums over whole sub-matrices, so
+    // no band is applied).
+    let mut x = ndarray::Array2::<f64>::zeros((n, n));
+    for p in cool.pixels_for_bins(first as i64, last as i64)? {
+        let (b1, b2) = (p.bin1_id as usize, p.bin2_id as usize);
+        if b2 < last {
+            let v = p.count;
+            x[[b1 - first, b2 - first]] = v;
+            x[[b2 - first, b1 - first]] = v;
+        }
+    }
+    if args.armatus.log {
+        for v in x.iter_mut() {
+            if *v > 0.0 {
+                *v = v.ln();
+            }
+        }
+    }
+    log::info!(" Loaded {n} bins ({res} bp/res)");
+
+    let ensemble = armatus::multiscale_domains(&x, &params);
+    let domains = armatus::consensus_domains(&ensemble);
+
+    let prefix = args.output.as_deref().unwrap_or(fin);
+    let fout = format!("{prefix}.consensus.txt");
+    let mut out = std::fs::File::create(&fout)?;
+    for d in &domains {
+        writeln!(
+            out,
+            "{}\t{}\t{}",
+            meta.name,
+            d.start * res,
+            (d.end + 1) * res - 1
+        )?;
+    }
+
+    if args.armatus.multiscale {
+        for (i, dset) in ensemble.domain_sets.iter().enumerate() {
+            let gamma = ensemble.resolutions[i];
+            let opt_idx = i % params.top_k;
+            let fmulti = format!("{prefix}.gamma.{gamma}.{opt_idx}.txt");
+            let mut f = std::fs::File::create(&fmulti)?;
+            for d in dset {
+                writeln!(
+                    f,
+                    "{}\t{}\t{}",
+                    meta.name,
+                    d.start * res,
+                    (d.end + 1) * res - 1
+                )?;
+            }
+        }
+    }
+
+    log::info!(" Called {} domains ({:.1?})", domains.len(), t0.elapsed());
+    log::info!("Output to {fout}");
     Ok(())
 }
 
