@@ -1,9 +1,6 @@
 //! Chromosome-level TAD calling: the `domaincaller` pipeline from
 //! TADLib (`tadlib/domaincaller/chromLev.py` + the HMM setup in
-//! `tadlib/hitad/genomeLev.py`).
-//!
-//! Ported faithfully so the Rust result matches TADLib exactly on the same
-//! input. The pipeline is:
+//! `tadlib/hitad/genomeLev.py`). The pipeline is:
 //! 1. estimate an adaptive window size per bin (`minWindows`),
 //! 2. compute a directionality index per bin (`calDI`),
 //! 3. split the chromosome into gap-free regions (`splitChrom`),
@@ -421,7 +418,6 @@ impl Chrom {
                 }
             }
         }
-        // TADLib: with 0 or 1 valid positions no region is formed.
         let mut gapmask = vec![true; dis.len()];
         for &(s, e) in regions.keys() {
             for g in &mut gapmask[s..e] {

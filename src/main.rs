@@ -3,6 +3,7 @@
 //! Subcommands:
 //!   `call-tad`  call hierarchical TADs from a .cool/.mcool contact matrix
 //!   `convert`   convert other matrix formats to/from cooler format
+//!   `balance`   out-of-core matrix balancing (iterative correction)
 
 mod cli;
 
@@ -25,6 +26,8 @@ enum Commands {
     CallTad(cli::call_tad::CallTadArgs),
     /// Convert other matrix formats to/from cooler format
     Convert(cli::convert::ConvertArgs),
+    /// Out-of-core matrix balancing (iterative correction)
+    Balance(cli::balance::BalanceArgs),
 }
 
 fn main() {
@@ -34,6 +37,7 @@ fn main() {
     let result = match cli.command {
         Commands::CallTad(args) => cli::call_tad::run(args),
         Commands::Convert(args) => cli::convert::run(args),
+        Commands::Balance(args) => cli::balance::run(args),
     };
     if let Err(e) = result {
         log::error!("{e}");

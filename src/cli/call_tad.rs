@@ -118,14 +118,11 @@ pub fn run(args: CallTadArgs) -> cooler_rs::Result<()> {
     }
 }
 
-/// Resolve the input into a `Cooler` and the selected chromosome's first/last
-/// bin offsets (shared by the per-method runners).
-fn open_cooler(
-    args: &CallTadArgs,
-    fin: &str,
-) -> cooler_rs::Result<(Cooler, usize, usize, ChromMeta)> {
-    let cool = if fin.ends_with(".cool") {
-        Cooler::open_any(fin)?
+/// Resolve the input into a `Cooler` at the requested resolution, without
+/// selecting a chromosome.
+fn open_cooler_file(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<Cooler> {
+    if fin.ends_with(".cool") {
+        Cooler::open_any(fin)
     } else if fin.ends_with(".mcool") {
         let mcool = Mcool::open(fin)?;
         let resolutions = mcool.resolutions()?;
@@ -138,14 +135,23 @@ fn open_cooler(
                 )));
             }
         };
-        mcool.cooler(res)?
+        mcool.cooler(res)
     } else {
-        return Err(Error::InvalidInput(
+        Err(Error::InvalidInput(
             "input must be a .cool or .mcool file \
              (use 'cooler-rs convert --from dense-txt' to convert dense text matrices)"
                 .into(),
-        ));
-    };
+        ))
+    }
+}
+
+/// Resolve the input into a `Cooler` and the selected chromosome's first/last
+/// bin offsets (shared by the per-method runners).
+fn open_cooler(
+    args: &CallTadArgs,
+    fin: &str,
+) -> cooler_rs::Result<(Cooler, usize, usize, ChromMeta)> {
+    let cool = open_cooler_file(args, fin)?;
 
     let chroms = cool.chroms()?;
     let chrom_id = match args.chr.as_deref() {
@@ -197,7 +203,7 @@ fn run_domaincaller(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     // Upper-triangle pixels of the selected chromosome (as TADLib feeds in);
     // drop cross-chromosome pixels whose bin2 falls beyond the chromosome.
     let mut entries = Vec::new();
-    for p in cool.pixels_for_bins(first, last)? {
+    for p in cool.pixels_for_bins(first as i64, last as i64)? {
         let (b1, b2) = (p.bin1_id as usize, p.bin2_id as usize);
         if b2 < last {
             entries.push((b1 - first, b2 - first, p.count));
@@ -231,14 +237,7 @@ fn run_domaincaller(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     for (i, &di) in chrom.dis.iter().enumerate() {
         let start = i * res;
         let end = ((i + 1) * res).min(meta.length as usize);
-        writeln!(
-            out,
-            "{}\t{}\t{}\t{:.4}",
-            meta.name,
-            start,
-            end,
-            di
-        )?;
+        writeln!(out, "{}\t{}\t{}\t{:.4}", meta.name, start, end, di)?;
     }
     log::info!(" Output to {fdom}, {fdi}");
     log::info!("Total run time: {:.1?}", t0.elapsed());
@@ -261,17 +260,9 @@ fn run_ontad(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     log::info!("Load {fin}:");
 
     let band = params.maxsz * 2;
-    let (cool, first, last, file_meta) = open_cooler(args, fin)?;
-    let l = last - first;
-    let mut x = ndarray::Array2::zeros((l, l));
-    for p in cool.pixels()? {
-        // Pixels are stored symmetric-upper (bin1_id <= bin2_id).
-        let (b1, b2) = (p.bin1_id as usize, p.bin2_id as usize);
-        if b1 >= first && b2 < last && b2 - b1 <= band {
-            x[[b1 - first, b2 - first]] = p.count;
-            x[[b2 - first, b1 - first]] = p.count;
-        }
-    }
+    let cool = open_cooler_file(args, fin)?;
+    // Banded, mirrored dense matrix for the chromosome (see ontad module).
+    let (mut x, file_meta) = ontad::matrix_from_cooler(&cool, args.chr.as_deref(), band)?;
 
     if args.log2 {
         for v in x.iter_mut() {

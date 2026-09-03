@@ -2,6 +2,7 @@ use ndarray::{Array2, ArrayView2, ArrayViewMut2};
 
 use crate::cooler::Cooler;
 use crate::error::{Error, Result};
+use crate::region::Region;
 use crate::types::ChromMeta;
 
 use super::{Params, Tad};
@@ -48,10 +49,12 @@ pub fn matrix_from_cooler(
     let l = last - first;
     let mut x = Array2::zeros((l, l));
 
-    for p in cool.pixels()? {
-        // Pixels are stored symmetric-upper (bin1_id <= bin2_id).
+    // Read only this chromosome's rows (bin1_id in [first, last)) instead of
+    // scanning the whole pixel table. Pixels are stored symmetric-upper.
+    let region = Region::chrom(chroms[chrom_id].name.clone());
+    for p in cool.pixels_in(&region)? {
         let (b1, b2) = (p.bin1_id as usize, p.bin2_id as usize);
-        if b1 >= first && b2 < last && b2 - b1 <= band {
+        if b2 < last && b2 - b1 <= band {
             x[[b1 - first, b2 - first]] = p.count;
             x[[b2 - first, b1 - first]] = p.count;
         }

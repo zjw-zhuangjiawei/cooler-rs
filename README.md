@@ -14,6 +14,10 @@ plus the `cooler-rs` command-line tool for Hi-C analysis.
     [OnTAD v1.4](https://github.com/anlin00007/OnTAD)).
   - `cooler-rs convert` — format conversion (e.g. `--from dense-txt`, a dense
     N×N text matrix to `.cool`).
+  - `cooler-rs balance` — out-of-core matrix balancing / iterative correction
+    (port of `cooler balance`): genome-wide, cis-only and trans-only modes,
+    MAD-max / min-nnz / min-count / blacklist bin filters, writes a `weight`
+    column back to the `.cool`/`.mcool` file.
 
 ## Usage
 
@@ -58,6 +62,9 @@ cargo run --release -- call-tad /tmp/toy.cool --method domaincaller --chr chr1 -
 
 # Dense matrix -> .cool
 cargo run --release -- convert --from dense-txt matrix.txt -o out.cool -L 250000000 -r 100000
+
+# Balance a contact matrix (writes a 'weight' column back to the file)
+cargo run --release -- balance /tmp/toy.cool
 ```
 
 Run `cooler-rs <COMMAND> --help` for the full option list of each subcommand.

@@ -4,8 +4,8 @@
 //!
 //! `domaincaller` uses only the two-way `align` + `conserved`, which compute
 //! the mismatch ratio that terminates `oriIter` early.
-// The loops keep TADLib's Python index arithmetic one-to-one (including the
-// in-loop `sidx` bound mutation and `&x` comparisons).
+// The loops reproduce TADLib's Python index arithmetic, including the
+// in-loop `sidx` bound mutation and `&x` comparisons.
 #![allow(clippy::needless_range_loop, clippy::mut_range_bound, clippy::op_ref)]
 
 use std::collections::{BTreeMap, BTreeSet};

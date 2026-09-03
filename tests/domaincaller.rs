@@ -3,7 +3,7 @@
 //! `mES_rep2.40Kb.raw.chr19.mat` (mouse ES cells, chr19, 40 kb; the same
 //! matrix the OnTAD regression uses).
 //!
-//! ## Golden files
+//! ## Expected files
 //!
 //! `data/mES_rep2.40Kb.raw.chr19.tadlib.dis` is the per-bin Directionality
 //! Index array and `data/mES_rep2.40Kb.raw.chr19.tadlib.domains` is the final
@@ -13,7 +13,7 @@
 //! reference values: the Rust port must match them to `1e-6` (DI) and exactly
 //! (domains).
 //!
-//! ## Regenerating the golden files
+//! ## Regenerating the expected files
 //!
 //! Requires a Python 3.11 venv with numpy 1.26, scipy, networkx 1.11,
 //! matplotlib, and pomegranate 0.10.0. pomegranate 0.10.0 no longer builds
@@ -84,13 +84,13 @@
 //!
 //! Note: `chrom.callDomains()` runs `oriIter` with early exit via
 //! `DomainAligner` (mismatch ratio < 0.05). On this matrix the loop runs all
-//! five rounds, but the golden captures the exact TADLib output either way.
+//! five rounds, but the expected files capture the exact TADLib output either way.
 
 use cooler_rs::domaincaller::Chrom;
 
 const MATRIX: &str = include_str!("data/mES_rep2.40Kb.raw.chr19.mat");
-const GOLDEN_DIS: &str = include_str!("data/mES_rep2.40Kb.raw.chr19.tadlib.dis");
-const GOLDEN_DOMAINS: &str = include_str!("data/mES_rep2.40Kb.raw.chr19.tadlib.domains");
+const EXPECTED_DIS: &str = include_str!("data/mES_rep2.40Kb.raw.chr19.tadlib.dis");
+const EXPECTED_DOMAINS: &str = include_str!("data/mES_rep2.40Kb.raw.chr19.tadlib.domains");
 
 // Helpers
 
@@ -133,13 +133,13 @@ fn run_domaincaller() -> Chrom {
 #[test]
 fn di_track_matches_tadlib() {
     let chrom = run_domaincaller();
-    let golden: Vec<f64> = GOLDEN_DIS
+    let expected: Vec<f64> = EXPECTED_DIS
         .lines()
-        .map(|l| l.parse().expect("bad golden dis"))
+        .map(|l| l.parse().expect("bad expected dis"))
         .collect();
-    assert_eq!(chrom.dis.len(), golden.len(), "DI length");
+    assert_eq!(chrom.dis.len(), expected.len(), "DI length");
     // The DI pipeline must be essentially exact; allow tiny float slack.
-    for (i, (&got, &exp)) in chrom.dis.iter().zip(golden.iter()).enumerate() {
+    for (i, (&got, &exp)) in chrom.dis.iter().zip(expected.iter()).enumerate() {
         assert!(
             (got - exp).abs() < 1e-6,
             "DI[{i}] = {got} != TADLib {exp} (diff {})",
@@ -151,7 +151,7 @@ fn di_track_matches_tadlib() {
 #[test]
 fn domains_match_tadlib() {
     let chrom = run_domaincaller();
-    let golden: Vec<(f64, f64)> = GOLDEN_DOMAINS
+    let expected: Vec<(f64, f64)> = EXPECTED_DOMAINS
         .lines()
         .map(|l| {
             let f: Vec<f64> = l.split_whitespace().map(|x| x.parse().unwrap()).collect();
@@ -161,12 +161,12 @@ fn domains_match_tadlib() {
     let got: Vec<(f64, f64)> = chrom.domains.iter().map(|d| (d[0], d[1])).collect();
     assert_eq!(
         got.len(),
-        golden.len(),
+        expected.len(),
         "domain count: got {} != {}",
         got.len(),
-        golden.len()
+        expected.len()
     );
-    for (i, ((gs, ge), (ss, se))) in golden.iter().zip(got.iter()).enumerate() {
+    for (i, ((gs, ge), (ss, se))) in expected.iter().zip(got.iter()).enumerate() {
         assert_eq!(ss, gs, "domain {i} start: Rust {ss} != TADLib {gs}");
         assert_eq!(se, ge, "domain {i} end: Rust {se} != TADLib {ge}");
     }

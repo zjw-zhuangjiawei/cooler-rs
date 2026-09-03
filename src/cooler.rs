@@ -5,18 +5,254 @@
 //! `pixels` and `indexes` tables, following schema version 3:
 //! <https://cooler.readthedocs.io/en/latest/schema.html>
 
+use std::ops::Range;
 use std::path::Path;
 
 use hdf5_metno::types::VarLenUnicode;
 use hdf5_metno::{File, Group};
+use ndarray::Array2;
+use sprs::TriMat;
 
 use crate::error::{Error, Result};
+use crate::region::Region;
 use crate::types::{Bin, Chrom, Pixel};
 
 /// Value of the `format` attribute for single-resolution files.
 pub const COOL_FORMAT: &str = "HDF5::Cooler";
 /// Schema version written to the `format-version` attribute.
 pub const COOL_FORMAT_VERSION: i64 = 3;
+
+/// A value to store as a dataset attribute (e.g. balancing stats).
+#[derive(Debug, Clone)]
+pub enum AttrValue {
+    /// 64-bit float.
+    F64(f64),
+    /// 64-bit integer (also used for booleans, since HDF5 has no bool type).
+    I64(i64),
+    /// 64-bit float array (per-chromosome balancing stats).
+    F64Array(Vec<f64>),
+}
+
+/// Rectangular submatrix query on the contact heatmap.
+///
+/// `rows` and `cols` are global bin-id half-open ranges `[lo, hi)` (see
+/// [`Cooler::extent`] to derive them from a genomic region). The returned
+/// matrix has shape `(rows.len(), cols.len())`, index `0` = bin `rows.start`.
+///
+/// Symmetric-upper storage: when `fill_lower` is true (default) the logical
+/// genome matrix — a reflection of every stored upper-triangle entry — is
+/// returned, so `m[[i, j]] == m[[j, i]]` holds for the on-diagonal case. When
+/// false, only the stored (upper) entries that fall inside `rows × cols` are
+/// placed, mirroring cooler-python's `DirectRangeQuery`.
+///
+/// `balance` names a `bins` column (e.g. `"weight"`) to multiply each cell by
+/// `w[i] * w[j]`. A missing column is an error, not silent.
+#[derive(Debug, Clone)]
+pub struct SubMatrix {
+    /// Row (bin1) range.
+    pub rows: Range<i64>,
+    /// Column (bin2) range.
+    pub cols: Range<i64>,
+    /// Mirror symmetric-upper entries into the other triangle. Default true.
+    pub fill_lower: bool,
+    /// Name of a bins column to scale values by (multiplicative). Default raw.
+    pub balance: Option<String>,
+}
+
+impl SubMatrix {
+    /// Square query: rows == cols.
+    pub fn square(bins: Range<i64>) -> Self {
+        let cols = bins.clone();
+        SubMatrix {
+            rows: bins,
+            cols,
+            fill_lower: true,
+            balance: None,
+        }
+    }
+
+    /// Rectangular query, with lower-triangle filling enabled.
+    pub fn rect(rows: Range<i64>, cols: Range<i64>) -> Self {
+        SubMatrix {
+            rows,
+            cols,
+            fill_lower: true,
+            balance: None,
+        }
+    }
+}
+
+/// Integrity report from [`Cooler::validate`].
+///
+/// `issues` lists every problem found; an empty vector means the file is
+/// internally consistent. Structural problems (a missing dataset, an
+/// undecodable dtype) are reported as issues too, so `validate` only fails
+/// when the file cannot be opened at all.
+#[derive(Debug, Default)]
+pub struct Validation {
+    /// Human-readable problems, empty when the file is valid.
+    pub issues: Vec<String>,
+}
+
+impl Validation {
+    /// True when no problems were found.
+    pub fn is_ok(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+
+/// Open an existing file read-write and resolve the collection group
+/// (`/` for a `.cool`, `/resolutions/<bin_size>` for an `.mcool`).
+fn open_group_rw<P: AsRef<Path>>(path: P, group_path: &str) -> Result<(File, Group)> {
+    let file = File::open_rw(path)?;
+    let group = if group_path == "/" {
+        file.group("/")?
+    } else {
+        file.group(group_path)?
+    };
+    Ok((file, group))
+}
+
+/// Add a float64 column to the `bins` table of an existing cooler file,
+/// overwriting any existing column of that name, and attach metadata attrs.
+///
+/// `group_path` is `/` for a `.cool`, or `/resolutions/<bin_size>` for an
+/// `.mcool`.
+pub fn write_bins_column<P: AsRef<Path>>(
+    path: P,
+    group_path: &str,
+    name: &str,
+    data: &[f64],
+    attrs: &[(&str, AttrValue)],
+) -> Result<()> {
+    let (_file, group) = open_group_rw(path, group_path)?;
+    let bins = group.group("bins")?;
+    if bins.link_exists(name) {
+        bins.unlink(name)?;
+    }
+    let ds = bins
+        .new_dataset::<f64>()
+        .shape(data.len())
+        .deflate(6)
+        .create(name)?;
+    ds.write(data)?;
+    for (attr_name, value) in attrs {
+        match value {
+            AttrValue::F64(v) => ds.new_attr::<f64>().create(*attr_name)?.write_scalar(v)?,
+            AttrValue::I64(v) => ds.new_attr::<i64>().create(*attr_name)?.write_scalar(v)?,
+            AttrValue::F64Array(v) => ds
+                .new_attr::<f64>()
+                .shape(v.len())
+                .create(*attr_name)?
+                .write(v)?,
+        }
+    }
+    Ok(())
+}
+
+/// Rename chromosome/contig entries of an existing cooler collection in
+/// place, mapping each `(old, new)` name. Names not listed are kept as is.
+///
+/// Bin ids and coordinates are untouched — this rewrites only the
+/// `chroms/name` strings (the chrom-to-bin mapping is by row index, not by
+/// name), so the pixel table and indexes stay valid. The bins/chrom column
+/// must hold plain integer codes; cooler-python files that store an HDF5
+/// enum mapping here are refused, because renaming without rebuilding that
+/// mapping would corrupt bin decoding.
+///
+/// Errors on an unknown old name or on a rename that would leave duplicate
+/// (or empty) names. `group_path` is `/` for a `.cool`, or
+/// `/resolutions/<bin_size>` for an `.mcool`.
+pub fn rename_chroms<P: AsRef<Path>>(
+    path: P,
+    group_path: &str,
+    renames: &[(&str, &str)],
+) -> Result<()> {
+    if renames.is_empty() {
+        return Ok(());
+    }
+    for (old, new) in renames {
+        if new.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "rename of '{old}' to an empty name"
+            )));
+        }
+    }
+    let (_file, group) = open_group_rw(path, group_path)?;
+
+    let cool = Cooler::from_group(group.clone())?;
+    let current = cool.chroms()?;
+
+    for (old, _) in renames {
+        if !current.iter().any(|c| c.name == *old) {
+            return Err(Error::InvalidInput(format!(
+                "cannot rename unknown chromosome '{old}'"
+            )));
+        }
+    }
+
+    let out: Vec<String> = current
+        .iter()
+        .map(|c| {
+            renames
+                .iter()
+                .find(|(old, _)| *old == c.name)
+                .map(|(_, new)| new.to_string())
+                .unwrap_or_else(|| c.name.clone())
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for name in &out {
+        if !seen.insert(name.clone()) {
+            return Err(Error::InvalidInput(format!(
+                "rename would produce duplicate chromosome name '{name}'"
+            )));
+        }
+    }
+
+    // Guard against py-cooler's enum-typed bins/chrom: codes would decode
+    // through the embedded name mapping, which we are not rebuilding.
+    let bins = group.group("bins")?;
+    let chrom_ds = bins.dataset("chrom")?;
+    if chrom_ds.size() > 0 {
+        chrom_ds.read_slice_1d::<i32, _>(0..1).map_err(|_| {
+            Error::Format(
+                "'bins/chrom' is not a plain int-code column (e.g. py-cooler \
+                 enum dtype); in-place rename would corrupt bin decoding"
+                    .into(),
+            )
+        })?;
+    }
+
+    // Rewrite the name column (bucket size may change with new lengths).
+    let chroms = group.group("chroms")?;
+    if chroms.link_exists("name") {
+        chroms.unlink("name")?;
+    }
+    write_strings(&chroms, "name", &out)?;
+    Ok(())
+}
+
+/// Remove a column from the `bins` table of an existing cooler file.
+///
+/// The required `chrom`/`start`/`end` columns cannot be removed; deleting a
+/// column that does not exist is an error. `group_path` is `/` for a
+/// `.cool`, or `/resolutions/<bin_size>` for an `.mcool`.
+pub fn delete_bins_column<P: AsRef<Path>>(path: P, group_path: &str, name: &str) -> Result<()> {
+    if matches!(name, "chrom" | "start" | "end") {
+        return Err(Error::InvalidInput(format!(
+            "'{name}' is a required bins column; cannot delete"
+        )));
+    }
+    let (_file, group) = open_group_rw(path, group_path)?;
+    let path = format!("bins/{name}");
+    if !group.link_exists(&path) {
+        return Err(Error::InvalidInput(format!("no '{path}' column to delete")));
+    }
+    let bins = group.group("bins")?;
+    bins.unlink(name)?;
+    Ok(())
+}
 
 fn write_strings(group: &Group, name: &str, values: &[String]) -> Result<()> {
     // cooler-python writes fixed-length ASCII (|S<maxlen>), which h5py/cooler
@@ -480,12 +716,50 @@ impl Cooler {
         }
     }
 
+    /// Read a contiguous slice of the pixel table by stored row position —
+    /// one chunk of a streaming pass over all pixels. Rows come back in
+    /// stored order.
+    pub fn pixels_range(&self, lo: i64, hi: i64) -> Result<Vec<Pixel>> {
+        let lo = lo as usize;
+        let hi = hi as usize;
+        let bin1_id: Vec<i64> = self
+            .group
+            .dataset("pixels/bin1_id")?
+            .read_slice_1d(lo..hi)?
+            .to_vec();
+        let bin2_id: Vec<i64> = self
+            .group
+            .dataset("pixels/bin2_id")?
+            .read_slice_1d(lo..hi)?
+            .to_vec();
+        let count: Vec<f64> = self
+            .group
+            .dataset("pixels/count")?
+            .read_slice_1d(lo..hi)?
+            .to_vec();
+        Ok(bin1_id
+            .into_iter()
+            .zip(bin2_id)
+            .zip(count)
+            .map(|((bin1_id, bin2_id), count)| Pixel {
+                bin1_id,
+                bin2_id,
+                count,
+            })
+            .collect())
+    }
+
+    /// Read the `bins/chrom` column (chromosome id per bin).
+    pub fn bin_chrom(&self) -> Result<Vec<i32>> {
+        Ok(self.group.dataset("bins/chrom")?.read_1d()?.to_vec())
+    }
+
     /// Read pixels whose `bin1_id` falls in `[first, last)` — one
     /// chromosome's rows. Uses `/indexes/bin1_offset` to slice.
-    pub fn pixels_for_bins(&self, first: usize, last: usize) -> Result<Vec<Pixel>> {
+    pub fn pixels_for_bins(&self, first: i64, last: i64) -> Result<Vec<Pixel>> {
         let offsets = self.bin1_offset()?;
-        let lo = offsets[first] as usize;
-        let hi = offsets[last] as usize;
+        let lo = offsets[first as usize] as usize;
+        let hi = offsets[last as usize] as usize;
         let bin1_id: Vec<i64> = self
             .group
             .dataset("pixels/bin1_id")?
@@ -559,5 +833,507 @@ impl Cooler {
             .dataset("indexes/chrom_offset")?
             .read_1d()?
             .to_vec())
+    }
+
+    /// Check the file for internal consistency (schema + index invariants)
+    /// and return every problem found as a [`Validation`].
+    ///
+    /// Verifies in a single pass that: the required tables/columns exist and
+    /// match the declared `nchroms`/`nbins`/`nnz` attributes; `chrom_offset`
+    /// and `bin1_offset` are monotone and partition the bins and pixel rows
+    /// exactly; every bin/chrom code matches its offset band and its
+    /// coordinates stay inside the chromosome with no overlaps; and every
+    /// pixel is symmetric-upper (`bin1 <= bin2`), in range, finite, and
+    /// stored grouped by `bin1_id` exactly as the row offsets say.
+    ///
+    /// Assumes the storage the rest of the crate reads: plain integer
+    /// `bins/chrom` codes (not py-cooler's enum dtype) and `symmetric-upper`
+    /// storage. Larger tables are streamed in chunks, so memory stays
+    /// bounded regardless of file size.
+    pub fn validate(&self) -> Result<Validation> {
+        let mut v = Validation::default();
+        let issues = &mut v.issues;
+        let group = &self.group;
+
+        macro_rules! read_col {
+            ($ty:ty, $path:expr) => {{
+                let p = $path;
+                match group.dataset(p) {
+                    Ok(ds) => match ds.read_1d::<$ty>() {
+                        Ok(x) => Some(x.to_vec()),
+                        Err(e) => {
+                            issues.push(format!("cannot decode '{p}' as {}: {e}", stringify!($ty)));
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        issues.push(format!("missing dataset '{p}': {e}"));
+                        None
+                    }
+                }
+            }};
+        }
+        let attr_i64 = |name: &str| -> Option<i64> {
+            group
+                .attr(name)
+                .ok()
+                .and_then(|a| a.read_scalar::<i64>().ok())
+        };
+
+        // --- chroms ------------------------------------------------------
+        let names = match self.read_strings("chroms/name") {
+            Ok(n) => Some(n),
+            Err(e) => {
+                issues.push(format!("cannot decode 'chroms/name': {e}"));
+                None
+            }
+        };
+        let lengths = read_col!(i32, "chroms/length");
+        let clens: Option<&Vec<i32>> = match (&names, &lengths) {
+            (Some(n), Some(l)) if n.len() == l.len() => Some(l),
+            _ => None,
+        };
+        let nchroms: Option<i64> = names.as_ref().map(|n| n.len() as i64);
+        if let (Some(n), Some(l)) = (&names, &lengths) {
+            if n.len() != l.len() {
+                issues.push(format!(
+                    "'chroms/name' and 'chroms/length' have different lengths ({} vs {})",
+                    n.len(),
+                    l.len()
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for (name, &len) in n.iter().zip(l.iter()) {
+                if len < 0 {
+                    issues.push(format!("chromosome '{name}' has negative length {len}"));
+                }
+                if !seen.insert(name) {
+                    issues.push(format!("duplicate chromosome name '{name}'"));
+                }
+            }
+            if n.is_empty() {
+                issues.push("chroms table is empty".into());
+            }
+        }
+        if let (Some(a), Some(n)) = (attr_i64("nchroms"), nchroms) {
+            if a != n {
+                issues.push(format!(
+                    "'nchroms' attribute {a} != chroms table length {n}"
+                ));
+            }
+        }
+
+        // --- bins --------------------------------------------------------
+        let bins_chrom = read_col!(i32, "bins/chrom");
+        let bin_starts = read_col!(i32, "bins/start");
+        let bin_ends = read_col!(i32, "bins/end");
+        let nbins: Option<i64> = match (&bins_chrom, &bin_starts, &bin_ends) {
+            (Some(a), Some(b), Some(c)) => {
+                if b.len() == a.len() && c.len() == a.len() {
+                    Some(a.len() as i64)
+                } else {
+                    issues.push(format!(
+                        "bins column lengths differ: chrom {}, start {}, end {}",
+                        a.len(),
+                        b.len(),
+                        c.len()
+                    ));
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let (Some(a), Some(n)) = (attr_i64("nbins"), nbins) {
+            if a != n {
+                issues.push(format!("'nbins' attribute {a} != bins table length {n}"));
+            }
+        }
+
+        // Chrom codes in range, and exactly matching the chrom_offset bands.
+        if let (Some(bc), Some(nch)) = (&bins_chrom, nchroms) {
+            for (k, &code) in bc.iter().enumerate() {
+                if code < 0 || i64::from(code) >= nch {
+                    issues.push(format!(
+                        "bin {k}: chrom code {code} out of range (nchroms={nch})"
+                    ));
+                }
+            }
+        }
+        let chrom_offset = read_col!(i64, "indexes/chrom_offset");
+        if let (Some(bc), Some(o), Some(nch)) = (&bins_chrom, &chrom_offset, nchroms) {
+            let n = nch as usize;
+            if o.len() != n + 1 {
+                issues.push(format!(
+                    "'chrom_offset' has {} entries, expected nchroms+1 = {}",
+                    o.len(),
+                    n + 1
+                ));
+            } else if o[0] != 0 || *o.last().unwrap() != bc.len() as i64 {
+                issues.push(format!(
+                    "'chrom_offset' spans {}..={}, expected 0..={}",
+                    o[0],
+                    o.last().unwrap(),
+                    bc.len()
+                ));
+            } else if !o.windows(2).all(|w| w[1] >= w[0]) {
+                issues.push("'chrom_offset' is not monotone".into());
+            } else {
+                let mut c = 0usize;
+                for (k, &code) in bc.iter().enumerate() {
+                    while c < n && (k as i64) >= o[c + 1] {
+                        c += 1;
+                    }
+                    if i64::from(code) != c as i64 {
+                        issues.push(format!(
+                            "bin {k}: chrom code {code} does not match chrom_offset band {c}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Bin coordinates: valid intervals, inside the chromosome, sorted.
+        if let (Some(bc), Some(bs), Some(be)) = (&bins_chrom, &bin_starts, &bin_ends) {
+            let mut prev: Option<(i32, i32)> = None; // (chrom, start)
+            for (k, (&code, (&s, &e))) in bc.iter().zip(bs.iter().zip(be.iter())).enumerate() {
+                if s < 0 || e <= s {
+                    issues.push(format!("bin {k}: empty or invalid interval [{s}, {e})"));
+                }
+                if let Some(clens) = clens {
+                    if (0..clens.len() as i32).contains(&code) && e > clens[code as usize] {
+                        issues.push(format!(
+                            "bin {k}: end {e} past chromosome {code} length {}",
+                            clens[code as usize]
+                        ));
+                    }
+                }
+                if let Some((pc, ps)) = prev {
+                    if pc == code && s <= ps {
+                        issues.push(format!(
+                            "bin {k}: interval [{s}, {e}) overlaps or duplicates the \
+                             previous bin of chromosome {code}"
+                        ));
+                    }
+                }
+                prev = Some((code, s));
+            }
+        }
+
+        // --- pixels ------------------------------------------------------
+        let nnz = match group.dataset("pixels/bin1_id") {
+            Ok(ds) => Some(ds.size() as u64),
+            Err(e) => {
+                issues.push(format!("missing dataset 'pixels/bin1_id': {e}"));
+                None
+            }
+        };
+        if let (Some(a), Some(n)) = (attr_i64("nnz"), nnz) {
+            if a as u64 != n {
+                issues.push(format!("'nnz' attribute {a} != pixel table length {n}"));
+            }
+        }
+        if let Some(n) = nnz {
+            for col in ["pixels/bin2_id", "pixels/count"] {
+                match group.dataset(col) {
+                    Ok(ds) if ds.size() as u64 == n => {}
+                    Ok(ds) => issues.push(format!(
+                        "'{col}' has {} rows, expected {n} pixels",
+                        ds.size()
+                    )),
+                    Err(e) => issues.push(format!("missing dataset '{col}': {e}")),
+                }
+            }
+        }
+
+        let bin1_offset = read_col!(i64, "indexes/bin1_offset");
+        if let (Some(nnz), Some(o1), Some(nb)) = (nnz, bin1_offset, nbins) {
+            let n = nb as usize;
+            if o1.len() != n + 1 {
+                issues.push(format!(
+                    "'bin1_offset' has {} entries, expected nbins+1 = {}",
+                    o1.len(),
+                    n + 1
+                ));
+            } else if o1[0] != 0 || *o1.last().unwrap() != nnz as i64 {
+                issues.push(format!(
+                    "'bin1_offset' spans {}..={}, expected 0..={nnz}",
+                    o1[0],
+                    o1.last().unwrap()
+                ));
+            } else if !o1.windows(2).all(|w| w[1] >= w[0]) {
+                issues.push("'bin1_offset' is not monotone".into());
+            } else {
+                // Stream rows, checking each row's bin1_id against the offset
+                // group its position falls into (implies grouped + sorted).
+                let step = 1_000_000usize;
+                let mut c = 0usize;
+                'rows: for lo in (0..nnz as usize).step_by(step) {
+                    let hi = (lo + step).min(nnz as usize);
+                    let rows = match self.pixels_range(lo as i64, hi as i64) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            issues.push(format!("cannot read pixel rows [{lo}, {hi}): {e}"));
+                            break 'rows;
+                        }
+                    };
+                    for (i, row) in rows.iter().enumerate() {
+                        let pos = lo as i64 + i as i64;
+                        while c < n && pos >= o1[c + 1] {
+                            c += 1;
+                        }
+                        if row.bin1_id != c as i64 {
+                            issues.push(format!(
+                                "pixel row {pos}: bin1_id {} does not match bin1_offset group {c}",
+                                row.bin1_id
+                            ));
+                        }
+                        if row.bin1_id > row.bin2_id {
+                            issues.push(format!(
+                                "pixel row {pos}: bin1_id {} > bin2_id {} (not symmetric-upper)",
+                                row.bin1_id, row.bin2_id
+                            ));
+                        }
+                        if row.bin1_id < 0
+                            || row.bin1_id >= nb
+                            || row.bin2_id < 0
+                            || row.bin2_id >= nb
+                        {
+                            issues.push(format!(
+                                "pixel row {pos}: bin ids ({}, {}) out of range for {n} bins",
+                                row.bin1_id, row.bin2_id
+                            ));
+                        }
+                        if !row.count.is_finite() {
+                            issues.push(format!("pixel row {pos}: non-finite count {}", row.count));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(v)
+    }
+
+    /// Global bin id containing the left end of a genomic region (the first
+    /// bin of an open-ended or whole-chromosome region). Equals the first
+    /// element of [`Cooler::extent`].
+    pub fn offset(&self, region: &Region) -> Result<i64> {
+        Ok(self.extent(region)?.0)
+    }
+
+    /// Bin-id range `[i0, i1)` covered by a genomic region, in global bin ids
+    /// across the whole collection (`i1` exclusive).
+    ///
+    /// The ids slice the bin table (`bins[i0..i1]`) and the pixel row index
+    /// (`bin1_offset[i0..i1]`), the latter giving the pixel rows whose
+    /// `bin1_id` falls in the range. Bins that overlap the half-open interval
+    /// are included; no boundary alignment is required.
+    ///
+    /// Regions are validated, not clamped: an unknown chromosome, an `end`
+    /// past the chromosome length, or `end < start` returns
+    /// [`Error::InvalidInput`]. A whole-chromosome region needs no bin size
+    /// and works for any file (variable bins included); a partial interval
+    /// requires a fixed `bin-size`.
+    pub fn extent(&self, region: &Region) -> Result<(i64, i64)> {
+        let chroms = self.chroms()?;
+        // TODO(cache): chroms/chrom_offset/bin-size are re-read per query.
+        // Cache them once region queries become a hot loop.
+        let Some((cid, clen)) = chroms
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.name == region.chrom)
+            .map(|(cid, c)| (cid, c.length))
+        else {
+            return Err(Error::InvalidInput(format!(
+                "unknown sequence label: {}",
+                region.chrom
+            )));
+        };
+        if clen < 0 {
+            return Err(Error::Format(format!(
+                "chromosome '{}' has negative length {clen}",
+                region.chrom
+            )));
+        }
+        let clen = clen as u64;
+        let start = region.start.unwrap_or(0);
+        let end = region.end.unwrap_or(clen);
+        if end < start {
+            return Err(Error::InvalidInput(format!(
+                "region out of bounds on '{}' (length {clen}): end {end} < start {start}",
+                region.chrom
+            )));
+        }
+        if end > clen {
+            return Err(Error::InvalidInput(format!(
+                "region out of bounds on '{}' (length {clen}): [{start}, {end})",
+                region.chrom
+            )));
+        }
+
+        let chrom_offset = self.chrom_offset()?;
+        let c0 = chrom_offset[cid];
+        let c1 = chrom_offset[cid + 1];
+
+        // Whole chromosome: offset table alone suffices, so this also works
+        // for files without a bin size (variable bins).
+        if start == 0 && end == clen {
+            return Ok((c0, c1));
+        }
+
+        // Partial interval: fixed-bin arithmetic only.
+        let Some(bin_size) = self.bin_size()? else {
+            // TODO(variable-bins): coordinate → bin needs a searchsorted pass
+            // over the chrom's bins/start slice (cf. cooler-python
+            // `core/_rangequery.py`); add when a variable-bins cooler needs
+            // region queries.
+            return Err(Error::Format(format!(
+                "region query on '{}' needs a fixed bin-size, but this file has none (variable bins)",
+                region.chrom
+            )));
+        };
+        if bin_size == 0 {
+            return Err(Error::Format("invalid file: bin-size is 0".into()));
+        }
+        let bs = bin_size;
+        let i0 = c0 + (start / bs) as i64;
+        let i1 = if end == start {
+            i0 // empty interval (e.g. a boundary point): no bins in range
+        } else {
+            c0 + end.div_ceil(bs) as i64
+        };
+        Ok((i0, i1))
+    }
+
+    /// Read bin-table rows `[lo, hi)` (stored row order).
+    pub fn bins_slice(&self, lo: i64, hi: i64) -> Result<Vec<Bin>> {
+        let (lo, hi) = (lo as usize, hi as usize);
+        let chrom_id: Vec<i32> = self
+            .group
+            .dataset("bins/chrom")?
+            .read_slice_1d(lo..hi)?
+            .to_vec();
+        let start: Vec<i32> = self
+            .group
+            .dataset("bins/start")?
+            .read_slice_1d(lo..hi)?
+            .to_vec();
+        let end: Vec<i32> = self
+            .group
+            .dataset("bins/end")?
+            .read_slice_1d(lo..hi)?
+            .to_vec();
+        Ok(chrom_id
+            .into_iter()
+            .zip(start)
+            .zip(end)
+            .map(|((chrom_id, start), end)| Bin {
+                chrom_id,
+                start,
+                end,
+            })
+            .collect())
+    }
+
+    /// Read the bins overlapping `region` (see [`Cooler::extent`]).
+    pub fn bins_in(&self, region: &Region) -> Result<Vec<Bin>> {
+        let (lo, hi) = self.extent(region)?;
+        self.bins_slice(lo, hi)
+    }
+
+    /// Read the stored pixels whose row (`bin1_id`) falls in `region` — the
+    /// lower-bound side of the region's band.
+    ///
+    /// Because pixels are stored symmetric-upper (`bin1_id <= bin2_id`), this
+    /// returns every row whose first bin is inside the region, including
+    /// cross-chromosome entries whose `bin2_id` lies beyond it. Dropping
+    /// those (keeping `bin2_id < extent.end`) leaves the intra-region
+    /// upper-triangle.
+    pub fn pixels_in(&self, region: &Region) -> Result<Vec<Pixel>> {
+        let (lo, hi) = self.extent(region)?;
+        self.pixels_for_bins(lo, hi)
+    }
+
+    /// Fetch the stored, de-duplicated non-zero cells of the `rows × cols`
+    /// submatrix as global `(row_bin, col_bin, value)` triples, optionally
+    /// reflected into the other triangle.
+    fn submatrix_cells(&self, q: &SubMatrix) -> Result<Vec<(i64, i64, f64)>> {
+        let nbins = self.group.dataset("bins/chrom")?.size() as i64;
+        for (name, r) in [("rows", &q.rows), ("cols", &q.cols)] {
+            if r.start < 0 || r.end > nbins || r.start >= r.end {
+                return Err(Error::InvalidInput(format!(
+                    "matrix {name} range {:?} out of bounds for {nbins} bins",
+                    r.start..r.end
+                )));
+            }
+        }
+        let r0 = q.rows.start;
+        let r1 = q.rows.end;
+        let c0 = q.cols.start;
+        let c1 = q.cols.end;
+
+        // Symmetric-upper: a stored entry (a, b) with a <= b contributes the
+        // logical cell (a, b) whenever a ∈ rows & b ∈ cols, and its reflection
+        // (b, a) whenever b ∈ rows & a ∈ cols. Reading rows-col and cols-row
+        // bands covers both; overlapping ranges duplicate cells, so results
+        // are sorted and de-duplicated below.
+        let mut cells: Vec<(i64, i64, f64)> = Vec::new();
+        let collect = |cells: &mut Vec<(i64, i64, f64)>, p: &Pixel| {
+            let (a, b) = (p.bin1_id, p.bin2_id);
+            if (r0..r1).contains(&a) && (c0..c1).contains(&b) {
+                cells.push((a, b, p.count));
+            }
+            if q.fill_lower && (r0..r1).contains(&b) && (c0..c1).contains(&a) {
+                cells.push((b, a, p.count));
+            }
+        };
+        for p in self.pixels_for_bins(r0, r1)? {
+            if (c0..c1).contains(&p.bin2_id) {
+                collect(&mut cells, &p);
+            }
+        }
+        if q.fill_lower {
+            for p in self.pixels_for_bins(c0, c1)? {
+                if (r0..r1).contains(&p.bin2_id) {
+                    collect(&mut cells, &p);
+                }
+            }
+        }
+
+        cells.sort_unstable_by_key(|c| (c.0, c.1));
+        cells.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+
+        if let Some(name) = &q.balance {
+            let w = self.bins_column_f64(name)?.ok_or_else(|| {
+                Error::InvalidInput(format!("no 'bins/{name}' column for balance"))
+            })?;
+            for c in &mut cells {
+                c.2 *= w[c.0 as usize] * w[c.1 as usize];
+            }
+        }
+        Ok(cells)
+    }
+
+    /// Fetch a dense 2D submatrix over `rows × cols` (see [`SubMatrix`]).
+    /// Shape `(nr, nc)`; cells with no stored (or reflected) entry are 0.0.
+    pub fn matrix_dense(&self, q: &SubMatrix) -> Result<Array2<f64>> {
+        let (nr, nc) = (q.rows.end - q.rows.start, q.cols.end - q.cols.start);
+        let mut out = Array2::zeros((nr as usize, nc as usize));
+        for (i, j, v) in self.submatrix_cells(q)? {
+            out[[(i - q.rows.start) as usize, (j - q.cols.start) as usize]] = v;
+        }
+        Ok(out)
+    }
+
+    /// Fetch the same submatrix in sparse coordinate form ([`sprs::TriMat`],
+    /// the equivalent of cooler-python's COO). Local coordinates, shape
+    /// `(nr, nc)`.
+    pub fn matrix_sparse(&self, q: &SubMatrix) -> Result<TriMat<f64>> {
+        let (nr, nc) = (q.rows.end - q.rows.start, q.cols.end - q.cols.start);
+        let mut tri = TriMat::new((nr as usize, nc as usize));
+        for (i, j, v) in self.submatrix_cells(q)? {
+            tri.add_triplet((i - q.rows.start) as usize, (j - q.cols.start) as usize, v);
+        }
+        Ok(tri)
     }
 }

@@ -36,18 +36,25 @@
 //! # }
 //! ```
 
+pub mod balance;
 pub mod convert;
 pub mod cooler;
 pub mod domaincaller;
 pub mod error;
 pub mod mcool;
 pub mod ontad;
+pub mod region;
 pub mod stats;
 pub mod types;
 
-pub use cooler::{Cooler, CoolerWriter};
+pub use balance::{balance_cooler, BalanceParams, BalanceStats};
+pub use cooler::{
+    delete_bins_column, rename_chroms, write_bins_column, AttrValue, Cooler, CoolerWriter,
+    SubMatrix, Validation,
+};
 pub use error::{Error, Result};
 pub use mcool::{Mcool, McoolWriter};
 pub use ontad::{Params, Tad};
+pub use region::Region;
 pub use stats::{DiscreteDistribution, GeneralMixtureModel, HiddenMarkovModel, NormalDistribution};
 pub use types::{Bin, Chrom, ChromMeta, Pixel};

@@ -1,11 +1,10 @@
 //! Hidden Markov Model with arbitrary emission distributions, trained by
 //! multi-sequence Baum-Welch.
 //!
-//! Ported from pomegranate 0.10.0 `hmm.pyx`, restricted to the subset
-//! `domaincaller` needs: dense models, univariate Gaussian/GMM emissions,
-//! silent `start`/`end` states. The DP tables, the CSR transition layout and
-//! the numerics (log space, `pair_lse`) replicate the Cython exactly so the
-//! hard-coded values in `pomegranate/tests/test_hmm.py` hold verbatim.
+//! Port of pomegranate 0.10.0 `hmm.pyx`, restricted to what `domaincaller`
+//! needs: dense models, univariate Gaussian/GMM emissions, and silent
+//! `start`/`end` states. The DP tables, the CSR transition layout and the
+//! numerics (log space, `pair_lse`) mirror the Cython (see `tests/stats.rs`).
 
 use std::collections::HashMap;
 

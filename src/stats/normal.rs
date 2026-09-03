@@ -101,7 +101,6 @@ impl Emission for NormalDistribution {
     }
 
     fn from_summaries(&mut self, inertia: f64, _emission_pseudocount: f64) {
-        // If no summaries stored, don't do anything.
         if self.summaries[0] < 1e-8 {
             return;
         }

@@ -1,6 +1,6 @@
 //! Rust port of the OnTAD algorithm (An et al., Genome Biology 2019),
-//! translated from the original C++ implementation (<https://github.com/anlin00007/OnTAD>,
-//! `step1`–`step4`), keeping the same numeric behavior.
+//! translated from the original C++ implementation
+//! (<https://github.com/anlin00007/OnTAD>, `step1`–`step4`).
 //!
 //! OnTAD calls hierarchical TADs from a Hi-C contact matrix in four steps:
 //! 1. load the matrix (only a band around the diagonal is used),
