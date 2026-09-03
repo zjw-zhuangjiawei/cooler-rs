@@ -74,7 +74,11 @@ struct WeightedInterval {
 impl WeightedInterval {
     fn new(s: usize, e: usize, sc: f64) -> Self {
         let (start, end) = if s < e { (s, e) } else { (e, s) };
-        WeightedInterval { start, end, score: sc }
+        WeightedInterval {
+            start,
+            end,
+            score: sc,
+        }
     }
 }
 

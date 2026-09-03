@@ -163,7 +163,13 @@ impl<'a> ArmatusDag<'a> {
 
     /// After popping the top candidate, push its next-ranked sibling
     /// (`back_optimal_index + 1`) so the heap yields the K best in order.
-    fn push_next(&self, heap: &mut BinaryHeap<SubProblem>, sub: SubProblem, is_domain: bool, l: usize) {
+    fn push_next(
+        &self,
+        heap: &mut BinaryHeap<SubProblem>,
+        sub: SubProblem,
+        is_domain: bool,
+        l: usize,
+    ) {
         let next = sub.back_optimal_index + 1;
         let kk = sub.back_pointer;
         if next < self.k {
