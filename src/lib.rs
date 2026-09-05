@@ -48,6 +48,7 @@ pub mod raichu;
 pub mod region;
 pub mod stats;
 pub mod types;
+pub mod zoomify;
 
 pub use armatus::{call_domains, Domain};
 pub use balance::{balance_cooler, BalanceParams, BalanceStats};
@@ -62,3 +63,6 @@ pub use raichu::{raichu_normalize, RaichuParams};
 pub use region::Region;
 pub use stats::{DiscreteDistribution, GeneralMixtureModel, HiddenMarkovModel, NormalDistribution};
 pub use types::{Bin, Chrom, ChromMeta, Pixel};
+pub use zoomify::{
+    coarsen_pixels, nice_resolutions, pow2_resolutions, zoomify_cooler, ZoomifyParams,
+};

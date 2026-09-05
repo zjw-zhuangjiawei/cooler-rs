@@ -16,6 +16,10 @@ plus the `cooler-rs` command-line tool for Hi-C analysis.
     [Armatus 2.3](https://github.com/kingsfordgroup/armatus) port).
   - `cooler-rs convert` — format conversion (e.g. `--from dense-txt`, a dense
     N×N text matrix to `.cool`).
+  - `cooler-rs zoomify` — coarsen a single-resolution `.cool` into a
+    multi-resolution `.mcool` (port of `cooler zoomify` / `hictk zoomify`):
+    pools `factor`×`factor` bins per chromosome and sums counts, with nice
+    (1-2-5) or power-of-two auto-generated resolutions.
   - `cooler-rs normalize` — contact matrix normalization:
     - `--method ic` (default) — out-of-core matrix balancing / iterative
       correction (port of `cooler balance`): genome-wide, cis-only and
@@ -72,6 +76,9 @@ cargo run --release -- call-tad /tmp/toy.cool --method armatus --chr chr1 --gamm
 # Dense matrix -> .cool
 cargo run --release -- convert --from dense-txt matrix.txt -o out.cool -L 250000000 -r 100000
 
+# Coarsen a single-resolution .cool into a multi-resolution .mcool
+cargo run --release -- zoomify /tmp/toy.cool -o /tmp/toy.mcool
+
 # Balance a contact matrix (iterative correction; writes a 'weight' column)
 cargo run --release -- normalize /tmp/toy.cool
 
@@ -105,6 +112,7 @@ link statically without a system HDF5.
 | `domaincaller`    | TADLib DomainCaller port (Dixon et al., 2012) |
 | `armatus`         | Armatus 2.3 multiresolution TAD port (Filippova et al., 2014) |
 | `balance`         | iterative-correction matrix balancing (port of `cooler balance`) |
+| `zoomify`         | coarsen a `.cool` into a multi-resolution `.mcool` (port of `cooler zoomify`) |
 | `raichu`          | Raichu sliding-window normalization (port of RaichuNorm) |
 | `stats`           | pomegranate 0.10.0 port: GMM / HMM / normal / discrete |
 | `error` / `types` | error type and shared structs       |
