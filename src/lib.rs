@@ -42,6 +42,7 @@ pub mod convert;
 pub mod cooler;
 pub mod domaincaller;
 pub mod error;
+pub mod hic;
 pub mod mcool;
 pub mod ontad;
 pub mod raichu;
@@ -57,6 +58,7 @@ pub use cooler::{
     SubMatrix, Validation,
 };
 pub use error::{Error, Result};
+pub use hic::{HiCFile, HicWriter};
 pub use mcool::{Mcool, McoolWriter};
 pub use ontad::{Params, Tad};
 pub use raichu::{raichu_normalize, RaichuParams};
