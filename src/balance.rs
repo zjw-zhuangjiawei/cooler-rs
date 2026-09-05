@@ -593,7 +593,7 @@ pub fn balance_cooler(clr: &Cooler, p: &BalanceParams) -> Result<(Vec<f64>, Bala
 
 /// Median of a slice. Mirrors `np.median` for odd lengths; the Python MAD-max
 /// code relies on the even-length median (mean of the two middle values).
-fn median(sorted: &[f64]) -> f64 {
+pub(crate) fn median(sorted: &[f64]) -> f64 {
     if sorted.is_empty() {
         return f64::NAN;
     }

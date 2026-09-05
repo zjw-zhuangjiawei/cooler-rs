@@ -16,10 +16,14 @@ plus the `cooler-rs` command-line tool for Hi-C analysis.
     [Armatus 2.3](https://github.com/kingsfordgroup/armatus) port).
   - `cooler-rs convert` — format conversion (e.g. `--from dense-txt`, a dense
     N×N text matrix to `.cool`).
-  - `cooler-rs balance` — out-of-core matrix balancing / iterative correction
-    (port of `cooler balance`): genome-wide, cis-only and trans-only modes,
-    MAD-max / min-nnz / min-count / blacklist bin filters, writes a `weight`
-    column back to the `.cool`/`.mcool` file.
+  - `cooler-rs normalize` — contact matrix normalization:
+    - `--method ic` (default) — out-of-core matrix balancing / iterative
+      correction (port of `cooler balance`): genome-wide, cis-only and
+      trans-only modes, MAD-max / min-nnz / min-count / blacklist bin filters,
+      writes a `weight` column back to the `.cool`/`.mcool` file.
+    - `--method raichu` — the Raichu sliding-window optimizer (port of
+      [RaichuNorm](https://github.com/XiaoTaoWang/Raichu)), writes an
+      `obj_weight` column.
 
 ## Usage
 
@@ -68,8 +72,11 @@ cargo run --release -- call-tad /tmp/toy.cool --method armatus --chr chr1 --gamm
 # Dense matrix -> .cool
 cargo run --release -- convert --from dense-txt matrix.txt -o out.cool -L 250000000 -r 100000
 
-# Balance a contact matrix (writes a 'weight' column back to the file)
-cargo run --release -- balance /tmp/toy.cool
+# Balance a contact matrix (iterative correction; writes a 'weight' column)
+cargo run --release -- normalize /tmp/toy.cool
+
+# Normalize with Raichu (writes an 'obj_weight' column)
+cargo run --release -- normalize /tmp/toy.cool --method raichu
 ```
 
 Run `cooler-rs <COMMAND> --help` for the full option list of each subcommand.
@@ -97,6 +104,8 @@ link statically without a system HDF5.
 | `ontad`           | OnTAD hierarchical TAD algorithm    |
 | `domaincaller`    | TADLib DomainCaller port (Dixon et al., 2012) |
 | `armatus`         | Armatus 2.3 multiresolution TAD port (Filippova et al., 2014) |
+| `balance`         | iterative-correction matrix balancing (port of `cooler balance`) |
+| `raichu`          | Raichu sliding-window normalization (port of RaichuNorm) |
 | `stats`           | pomegranate 0.10.0 port: GMM / HMM / normal / discrete |
 | `error` / `types` | error type and shared structs       |
 

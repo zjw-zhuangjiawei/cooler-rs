@@ -44,6 +44,7 @@ pub mod domaincaller;
 pub mod error;
 pub mod mcool;
 pub mod ontad;
+pub mod raichu;
 pub mod region;
 pub mod stats;
 pub mod types;
@@ -57,6 +58,7 @@ pub use cooler::{
 pub use error::{Error, Result};
 pub use mcool::{Mcool, McoolWriter};
 pub use ontad::{Params, Tad};
+pub use raichu::{raichu_normalize, RaichuParams};
 pub use region::Region;
 pub use stats::{DiscreteDistribution, GeneralMixtureModel, HiddenMarkovModel, NormalDistribution};
 pub use types::{Bin, Chrom, ChromMeta, Pixel};
