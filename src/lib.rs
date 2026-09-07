@@ -38,6 +38,7 @@
 
 pub mod armatus;
 pub mod balance;
+pub mod compare;
 pub mod convert;
 pub mod cooler;
 pub mod domaincaller;
@@ -53,6 +54,7 @@ pub mod zoomify;
 
 pub use armatus::{call_domains, Domain};
 pub use balance::{balance_cooler, BalanceParams, BalanceStats};
+pub use compare::{compare_pair, CompareMetric, CompareParams};
 pub use cooler::{
     delete_bins_column, rename_chroms, write_bins_column, AttrValue, Cooler, CoolerWriter,
     SubMatrix, Validation,

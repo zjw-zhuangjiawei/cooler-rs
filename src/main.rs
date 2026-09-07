@@ -2,6 +2,7 @@
 //!
 //! Subcommands:
 //!   `call-tad`  call hierarchical TADs from a .cool/.mcool contact matrix
+//!   `compare`   compare multiple matrices and plot a correlation heatmap
 //!   `convert`   convert other matrix formats to/from cooler format
 //!   `normalize` normalize a contact matrix (ic or raichu)
 //!   `zoomify`   coarsen a single-resolution .cool into a multi-resolution .mcool
@@ -25,6 +26,8 @@ struct Cli {
 enum Commands {
     /// Call hierarchical TADs from a .cool/.mcool contact matrix
     CallTad(cli::call_tad::CallTadArgs),
+    /// Compare multiple contact matrices and plot a correlation heatmap
+    Compare(cli::compare::CompareArgs),
     /// Convert other matrix formats to/from cooler format
     Convert(cli::convert::ConvertArgs),
     /// Normalize a contact matrix (iterative correction or Raichu)
@@ -39,6 +42,7 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Commands::CallTad(args) => cli::call_tad::run(args),
+        Commands::Compare(args) => cli::compare::run(args),
         Commands::Convert(args) => cli::convert::run(args),
         Commands::Normalize(args) => cli::normalize::run(args),
         Commands::Zoomify(args) => cli::zoomify::run(args),

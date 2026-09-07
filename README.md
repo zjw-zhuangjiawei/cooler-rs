@@ -28,6 +28,11 @@ plus the `cooler-rs` command-line tool for Hi-C analysis.
     - `--method raichu` — the Raichu sliding-window optimizer (port of
       [RaichuNorm](https://github.com/XiaoTaoWang/Raichu)), writes an
       `obj_weight` column.
+  - `cooler-rs compare` — pairwise similarity between N contact matrices,
+    rendered as a correlation heatmap: `--metric scc` (the HiCRep
+    stratum-adjusted correlation coefficient, a port of
+    [hicrep](https://github.com/cmdoret/hicrep)), `--metric pearson`, and
+    `--metric spearman`.
 
 ## Usage
 
@@ -84,6 +89,9 @@ cargo run --release -- normalize /tmp/toy.cool
 
 # Normalize with Raichu (writes an 'obj_weight' column)
 cargo run --release -- normalize /tmp/toy.cool --method raichu
+
+# Compare two matrices and write a correlation heatmap (default: all metrics)
+cargo run --release -- compare /tmp/toy.cool /tmp/toy2.cool --metric scc --metric pearson -o heatmap
 ```
 
 Run `cooler-rs <COMMAND> --help` for the full option list of each subcommand.
@@ -114,6 +122,7 @@ link statically without a system HDF5.
 | `balance`         | iterative-correction matrix balancing (port of `cooler balance`) |
 | `zoomify`         | coarsen a `.cool` into a multi-resolution `.mcool` (port of `cooler zoomify`) |
 | `raichu`          | Raichu sliding-window normalization (port of RaichuNorm) |
+| `compare`         | pairwise SCC / Pearson / Spearman similarity (port of hicrep) |
 | `stats`           | pomegranate 0.10.0 port: GMM / HMM / normal / discrete |
 | `error` / `types` | error type and shared structs       |
 
