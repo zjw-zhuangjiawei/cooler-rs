@@ -220,6 +220,7 @@ dependencies = [
  "ndarray",
  "plotters",
  "rand",
+ "rayon",
  "serde",
  "serde_json",
  "sprs",

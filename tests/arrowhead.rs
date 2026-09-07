@@ -47,6 +47,28 @@ fn finds_domains_on_hic_kr() {
     assert!(!domains.is_empty(), "expected domains on 2L with KR");
 }
 
+/// `File` is shared read-only across the rayon window/chromosome tasks, so it
+/// must be `Send + Sync` (compile-time; the `.hic` reader holds a `Mutex`).
+#[test]
+fn file_is_send_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<File>();
+}
+
+/// Parallelism must not change results: same input, same output (order is
+/// preserved by the rayon collect, and each window runs the serial path).
+#[test]
+fn parallel_run_is_deterministic() {
+    let Some(path) = fixture("4DNFIOTPSS3L.hic") else {
+        eprintln!("skipping: 4DNFIOTPSS3L.hic not present");
+        return;
+    };
+    let f = File::open(path.to_str().unwrap(), 5000).unwrap();
+    let a = arrowhead::call_chrom(&f, "2L", Some("KR"), &small_params()).unwrap();
+    let b = arrowhead::call_chrom(&f, "2L", Some("KR"), &small_params()).unwrap();
+    assert_eq!(a, b, "parallel call_chrom must be deterministic");
+}
+
 #[test]
 fn runs_on_mcool_raw() {
     let Some(path) = fixture("4DNFIZ1ZVXC8.mcool") else {

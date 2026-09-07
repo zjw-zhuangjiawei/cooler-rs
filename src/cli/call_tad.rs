@@ -54,6 +54,12 @@ pub struct CallTadArgs {
     #[arg(long = "res", value_name = "N")]
     res: Option<u64>,
 
+    /// Worker threads for arrowhead's per-window/chromosome parallelism.
+    /// Default is conservative: each window allocates hundreds of MB, so more
+    /// threads can thrash memory and run slower than fewer.
+    #[arg(long, value_name = "N", default_value_t = 4)]
+    threads: usize,
+
     /// Apply log2(x + 1) to the matrix
     #[arg(long = "log2")]
     log2: bool,
@@ -478,19 +484,29 @@ fn run_arrowhead(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     let params = args.arrowhead.params();
     let norm = args.arrowhead.norm.as_deref();
     log::info!(
-        "Arrowhead (Rust port of juicer): window={}, var={:?}, high_sign={}, min_block_size={}, norm={:?}",
+        "Arrowhead (Rust port of juicer): window={}, var={:?}, high_sign={}, min_block_size={}, norm={:?}, threads={}",
         params.matrix_width,
         params.var_threshold,
         params.high_sign_threshold,
         params.min_block_size,
-        norm
+        norm,
+        args.threads
     );
     let t0 = Instant::now();
 
     let res = resolve_arrowhead_resolution(args, fin)?;
     let f = File::open(fin, res)?;
     let chroms: Option<Vec<String>> = args.chr.clone().map(|c| vec![c]);
-    let domains = arrowhead::call_domains(&f, norm, &params, chroms.as_deref())?;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build()
+        .map_err(|e| {
+            Error::InvalidInput(format!(
+                "cannot build thread pool with {} threads: {e}",
+                args.threads
+            ))
+        })?;
+    let domains = pool.install(|| arrowhead::call_domains(&f, norm, &params, chroms.as_deref()))?;
 
     let prefix = args.output.as_deref().unwrap_or(fin);
     let fout = format!("{prefix}.arrowhead.bedpe");

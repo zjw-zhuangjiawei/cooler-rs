@@ -9,11 +9,11 @@
 //! vector of [`Pixel`]s in `symmetric-upper` form (`bin1_id <= bin2_id`), with
 //! bin ids spanning the non-`All` chromosomes in header order.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Mutex;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use flate2::read::ZlibDecoder;
@@ -25,7 +25,10 @@ use crate::types::{Chrom, Pixel};
 
 /// Reader for a `.hic` file.
 pub struct HiCFile {
-    file: RefCell<File>,
+    // `Mutex` (not `RefCell`) so a `HiCFile` is `Sync`: arrowhead reads one
+    // `File` from many threads at once. Each method takes the lock for the
+    // duration of a single call; nothing re-enters it, so there is no deadlock.
+    file: Mutex<File>,
     version: i32,
     genome_id: String,
     /// Chromosomes in header order, including the `All` pseudo-chromosome.
@@ -138,7 +141,7 @@ impl HiCFile {
         let index = read_master_index(&mut file, master_index_pos, version)?;
 
         Ok(HiCFile {
-            file: RefCell::new(file),
+            file: Mutex::new(file),
             version,
             genome_id,
             chroms,
@@ -195,7 +198,7 @@ impl HiCFile {
         }
 
         let entries = self.index.clone();
-        let mut file = self.file.borrow_mut();
+        let mut file = self.file.lock().expect("hic lock poisoned");
         let mut pixels = Vec::new();
         for entry in &entries {
             let c1 = header_to_cooler[entry.chrom1];
@@ -258,7 +261,7 @@ impl HiCFile {
         let Some(entry) = entry else {
             return Ok(None);
         };
-        let mut file = self.file.borrow_mut();
+        let mut file = self.file.lock().expect("hic lock poisoned");
         let f: &mut File = &mut file;
         f.seek(SeekFrom::Start(entry.position))?;
         let n_values = read_n_values(f, self.version)? as usize;
@@ -285,7 +288,7 @@ impl HiCFile {
 
     /// Walk the footer to the normalization-vector index and return its entries.
     fn read_norm_entries(&self) -> Result<Vec<NormEntry>> {
-        let mut file = self.file.borrow_mut();
+        let mut file = self.file.lock().expect("hic lock poisoned");
         let f: &mut File = &mut file;
         f.seek(SeekFrom::Start(self.footer_pos))?;
         // Footer size in bytes.

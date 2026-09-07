@@ -13,8 +13,10 @@ mod triangles;
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::time::Instant;
 
 use ndarray::Array2;
+use rayon::prelude::*;
 
 use crate::error::{Error, Result};
 use crate::file::File;
@@ -192,7 +194,37 @@ fn block_results(
     tri.calculate_results(&components)
 }
 
+/// The diagonal windows of one pass, as `(lo, hi)` bin half-open ranges in
+/// global bin ids (juicer `BlockBuster.run` windowing).
+fn window_ranges(n_bins: usize, matrix_width: usize) -> Vec<(usize, usize)> {
+    let increment = matrix_width / 2;
+    let mut out = Vec::new();
+    let mut lim_start = 0usize;
+    while lim_start < n_bins {
+        let lim_end_incl = (lim_start + matrix_width).min(n_bins);
+        // juicer backs the final window off so the tail is scanned at full
+        // width, overlapping the previous window.
+        let lo = if lim_end_incl == n_bins && n_bins > increment {
+            n_bins.saturating_sub(matrix_width)
+        } else {
+            lim_start
+        };
+        let hi = (lim_end_incl + 1).min(n_bins);
+        if hi <= lo {
+            break;
+        }
+        out.push((lo, hi));
+        lim_start += increment;
+    }
+    out
+}
+
 /// Slide across the chromosome diagonal, accumulating one pass's blocks.
+///
+/// Windows are independent, so they run on the rayon pool. The per-window
+/// results are collected in window order (rayon preserves index order), which
+/// keeps the output byte-identical to the serial run: later steps
+/// (`bin_scores_by_distance`) are order-sensitive.
 #[allow(clippy::too_many_arguments)]
 fn call_sub_blockbuster(
     f: &File,
@@ -205,35 +237,28 @@ fn call_sub_blockbuster(
     sign_threshold: f64,
     params: &Params,
 ) -> Result<Vec<HighScore>> {
-    let increment = params.matrix_width / 2;
     let gap = params.gap;
-    let mut results = Vec::new();
-
-    let mut lim_start = 0usize;
-    while lim_start < n_bins {
-        let lim_end_incl = (lim_start + params.matrix_width).min(n_bins);
-        // juicer backs the final window off so the tail is scanned at full
-        // width, overlapping the previous window.
-        let lo = if lim_end_incl == n_bins && n_bins > increment {
-            n_bins.saturating_sub(params.matrix_width)
-        } else {
-            lim_start
-        };
-        let hi = (lim_end_incl + 1).min(n_bins);
-        if hi <= lo {
-            break;
-        }
-        let observed = fetch_window_matrix(f, chrom, res, lo as i64, hi as i64, chrom_len, norm)?;
-        let mut window = block_results(&observed, var_threshold, sign_threshold, gap);
-        for s in &mut window {
-            // Offset by the true window start (juicer offsets by `limStart`,
-            // which misplaces the final window's domains; see plan).
-            s.offset_index(lo as i64);
-        }
-        results.extend(window);
-        lim_start += increment;
-    }
-    Ok(results)
+    let windows = window_ranges(n_bins, params.matrix_width);
+    let per_window: Result<Vec<Vec<HighScore>>> = windows
+        .par_iter()
+        .map(|&(lo, hi)| {
+            let observed =
+                fetch_window_matrix(f, chrom, res, lo as i64, hi as i64, chrom_len, norm)?;
+            let mut window = block_results(&observed, var_threshold, sign_threshold, gap);
+            for s in &mut window {
+                // Offset by the true window start (juicer offsets by `limStart`,
+                // which misplaces the final window's domains; see plan).
+                s.offset_index(lo as i64);
+            }
+            log::debug!(
+                "    [{chrom}] window [{lo},{hi}): {} bins, {} blocks",
+                hi - lo,
+                window.len()
+            );
+            Ok(window)
+        })
+        .collect();
+    Ok(per_window?.into_iter().flatten().collect())
 }
 
 /// The low/high-confidence two-pass sweep + merge for one chromosome.
@@ -243,6 +268,7 @@ pub fn call_chrom(
     norm: Option<&str>,
     params: &Params,
 ) -> Result<Vec<Domain>> {
+    let t0 = Instant::now();
     let chroms = f.chroms()?;
     let c = chroms
         .iter()
@@ -250,6 +276,8 @@ pub fn call_chrom(
         .ok_or_else(|| Error::InvalidInput(format!("chromosome '{chrom}' not found")))?;
     let res = f.resolution() as u64;
     let n_bins = (c.length as u64).div_ceil(res) as usize;
+    let n_windows = window_ranges(n_bins, params.matrix_width).len();
+    log::info!("[{chrom}] {n_bins} bins -> {n_windows} windows (res {res}, norm {norm:?})");
 
     // Low-confidence pass: relax the sign threshold until blocks appear.
     let mut sign_threshold = params.max_low_sign_threshold;
@@ -266,10 +294,15 @@ pub fn call_chrom(
             params,
         )?;
         if !l.is_empty() {
+            log::info!(
+                "[{chrom}] low-confidence pass at sign<={sign_threshold:.1}: {} blocks",
+                l.len()
+            );
             break l;
         }
         sign_threshold -= params.decrement_low_sign_threshold;
         if sign_threshold < params.min_low_sign_threshold - 1e-12 {
+            log::info!("[{chrom}] low-confidence pass: no blocks at any sign threshold");
             break l;
         }
     };
@@ -286,9 +319,11 @@ pub fn call_chrom(
         params.high_sign_threshold,
         params,
     )?;
+    log::info!("[{chrom}] high-confidence pass: {} blocks", high.len());
 
     let unique = ordered_set_difference(&low, &high);
     let filtered = filter_blocks_by_size(unique, params.min_block_size);
+    let n_added = filtered.len();
     append_non_conflicting_blocks(&mut high, filtered);
 
     for s in &mut high {
@@ -300,7 +335,7 @@ pub fn call_chrom(
     let mut sorted = binned;
     sorted.sort_by(|a, b| b.sort_value().total_cmp(&a.sort_value()));
 
-    Ok(sorted
+    let domains: Vec<Domain> = sorted
         .into_iter()
         .map(|s| Domain {
             chrom: chrom.to_string(),
@@ -312,10 +347,19 @@ pub fn call_chrom(
             up_sign: s.up_sign,
             lo_sign: s.lo_sign,
         })
-        .collect())
+        .collect();
+    log::info!(
+        "[{chrom}] {} domains after merge (+{n_added} low-confidence) ({:.1?})",
+        domains.len(),
+        t0.elapsed()
+    );
+    Ok(domains)
 }
 
 /// Call domains on several chromosomes (all, when `chroms` is `None`).
+///
+/// Chromosomes are independent and run on the rayon pool; their results are
+/// collected in input order, so the output equals the serial order exactly.
 pub fn call_domains(
     f: &File,
     norm: Option<&str>,
@@ -326,11 +370,19 @@ pub fn call_domains(
         Some(cs) => cs.to_vec(),
         None => f.chroms()?.into_iter().map(|c| c.name).collect(),
     };
-    let mut out = Vec::new();
-    for name in names {
-        out.extend(call_chrom(f, &name, norm, params)?);
-    }
-    Ok(out)
+    let n = names.len();
+    log::info!("arrowhead: {n} chromosomes");
+    let per_chrom: Result<Vec<Vec<Domain>>> = names
+        .par_iter()
+        .enumerate()
+        .map(|(i, name)| {
+            if n > 1 {
+                log::info!("[{}/{}] {name}", i + 1, n);
+            }
+            call_chrom(f, name, norm, params)
+        })
+        .collect();
+    Ok(per_chrom?.into_iter().flatten().collect())
 }
 
 fn ordered_set_difference(a: &[HighScore], b: &[HighScore]) -> Vec<HighScore> {

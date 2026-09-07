@@ -21,6 +21,7 @@ log = "0.4"
 ndarray = "0.17"
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "ttf"] }
 rand = "0.9"
+rayon = "1"
 sprs = "0.11"
 thiserror = "2"
 
