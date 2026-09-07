@@ -9,6 +9,7 @@
 //! vector of [`Pixel`]s in `symmetric-upper` form (`bin1_id <= bin2_id`), with
 //! bin ids spanning the non-`All` chromosomes in header order.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
@@ -24,13 +25,17 @@ use crate::types::{Chrom, Pixel};
 
 /// Reader for a `.hic` file.
 pub struct HiCFile {
-    file: File,
+    file: RefCell<File>,
     version: i32,
     genome_id: String,
     /// Chromosomes in header order, including the `All` pseudo-chromosome.
     chroms: Vec<Chrom>,
     resolutions: Vec<u32>,
     index: Vec<IndexEntry>,
+    /// File offset of the footer (master index, expected values, norm index).
+    footer_pos: u64,
+    /// Header attribute dictionary (key/value string pairs).
+    attributes: BTreeMap<String, String>,
 }
 
 /// One `(chr1, chr2)` matrix record from the footer master index.
@@ -86,9 +91,11 @@ impl HiCFile {
 
         // Attribute dictionary (key/value string pairs).
         let n_attrs = file.read_i32::<LittleEndian>()?;
+        let mut attributes = BTreeMap::new();
         for _ in 0..n_attrs {
-            read_cstring(&mut file)?;
-            read_cstring(&mut file)?;
+            let key = read_cstring(&mut file)?;
+            let value = read_cstring(&mut file)?;
+            attributes.insert(key, value);
         }
 
         // Chromosome list (length is i32 for v8, i64 for v9).
@@ -131,12 +138,14 @@ impl HiCFile {
         let index = read_master_index(&mut file, master_index_pos, version)?;
 
         Ok(HiCFile {
-            file,
+            file: RefCell::new(file),
             version,
             genome_id,
             chroms,
             resolutions,
             index,
+            footer_pos: master_index_pos,
+            attributes,
         })
     }
 
@@ -168,7 +177,7 @@ impl HiCFile {
     ///
     /// Returns `symmetric-upper` pixels (`bin1_id <= bin2_id`) over the
     /// non-`All` chromosomes.
-    pub fn pixels(&mut self, resolution: u32) -> Result<Vec<Pixel>> {
+    pub fn pixels(&self, resolution: u32) -> Result<Vec<Pixel>> {
         // Map header chromosome index -> non-All index (skip the "All" chrom).
         let real_indices: Vec<usize> = (0..self.chroms.len())
             .filter(|&i| !is_all_chrom(&self.chroms[i].name))
@@ -186,6 +195,7 @@ impl HiCFile {
         }
 
         let entries = self.index.clone();
+        let mut file = self.file.borrow_mut();
         let mut pixels = Vec::new();
         for entry in &entries {
             let c1 = header_to_cooler[entry.chrom1];
@@ -193,9 +203,9 @@ impl HiCFile {
             if c1 == usize::MAX || c2 == usize::MAX {
                 continue; // involves the "All" pseudo-chromosome
             }
-            let meta = read_matrix(&mut self.file, *entry, resolution)?;
+            let meta = read_matrix(&mut file, *entry, resolution)?;
             for block in &meta.blocks {
-                for (bin_x, bin_y, count) in read_block(&mut self.file, block)? {
+                for (bin_x, bin_y, count) in read_block(&mut file, block)? {
                     pixels.push(Pixel {
                         bin1_id: offsets[c1] + bin_x as i64,
                         bin2_id: offsets[c2] + bin_y as i64,
@@ -205,6 +215,123 @@ impl HiCFile {
             }
         }
         Ok(pixels)
+    }
+
+    /// Header attribute dictionary.
+    pub fn attributes(&self) -> &BTreeMap<String, String> {
+        &self.attributes
+    }
+
+    /// Names of the normalization vectors stored in the footer (deduped,
+    /// `BP` unit only), e.g. `["KR", "VC", "SCALE"]`.
+    pub fn avail_normalizations(&self) -> Result<Vec<String>> {
+        let mut names: Vec<String> = self
+            .read_norm_entries()?
+            .into_iter()
+            .filter(|e| e.unit == "BP")
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// Read one normalization vector (divisive) for a chromosome, if present.
+    pub fn norm_vector(
+        &self,
+        resolution: u32,
+        chrom: &str,
+        name: &str,
+    ) -> Result<Option<Vec<f64>>> {
+        let chrom_idx = self
+            .chroms
+            .iter()
+            .position(|c| c.name == chrom)
+            .ok_or_else(|| Error::InvalidInput(format!("unknown sequence label: {chrom}")))?
+            as i32;
+        let entry = self.read_norm_entries()?.into_iter().find(|e| {
+            e.name == name
+                && e.resolution == resolution
+                && e.chrom_idx == chrom_idx
+                && e.unit == "BP"
+        });
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        let mut file = self.file.borrow_mut();
+        let f: &mut File = &mut file;
+        f.seek(SeekFrom::Start(entry.position))?;
+        let n_values = read_n_values(f, self.version)? as usize;
+        // The stored vector can carry a few trailing zeros past the real bin
+        // count (a known .hic quirk); read only the expected values.
+        let expected =
+            (self.chroms[chrom_idx as usize].length as u64).div_ceil(resolution as u64) as usize;
+        if n_values < expected {
+            return Err(Error::Format(format!(
+                "normalization vector truncated: {n_values} values, expected {expected}"
+            )));
+        }
+        let mut values = Vec::with_capacity(expected);
+        for _ in 0..expected {
+            let v = if self.version > 8 {
+                f.read_f32::<LittleEndian>()? as f64
+            } else {
+                f.read_f64::<LittleEndian>()?
+            };
+            values.push(v);
+        }
+        Ok(Some(values))
+    }
+
+    /// Walk the footer to the normalization-vector index and return its entries.
+    fn read_norm_entries(&self) -> Result<Vec<NormEntry>> {
+        let mut file = self.file.borrow_mut();
+        let f: &mut File = &mut file;
+        f.seek(SeekFrom::Start(self.footer_pos))?;
+        // Footer size in bytes.
+        if self.version > 8 {
+            f.read_i64::<LittleEndian>()?;
+        } else {
+            f.read_i32::<LittleEndian>()?;
+        }
+        // Master index.
+        let n = f.read_i32::<LittleEndian>()?;
+        for _ in 0..n {
+            read_cstring(f)?;
+            f.read_i64::<LittleEndian>()?;
+            f.read_i32::<LittleEndian>()?;
+        }
+        // A footer with no expected/norm sections ends here (older writers).
+        let file_len = f.metadata()?.len();
+        if f.stream_position()? == file_len {
+            return Ok(Vec::new());
+        }
+        // Expected value vectors, then normalized expected value vectors.
+        skip_expected_section(f, self.version, false)?;
+        skip_expected_section(f, self.version, true)?;
+        // Normalization vector index.
+        let n = f.read_i32::<LittleEndian>()?;
+        let mut out = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let name = read_cstring(f)?;
+            let chrom_idx = f.read_i32::<LittleEndian>()?;
+            let unit = read_cstring(f)?;
+            let resolution = f.read_i32::<LittleEndian>()? as u32;
+            let position = f.read_i64::<LittleEndian>()? as u64;
+            let _size = if self.version > 8 {
+                f.read_i64::<LittleEndian>()? as u64
+            } else {
+                f.read_i32::<LittleEndian>()? as u32 as u64
+            };
+            out.push(NormEntry {
+                name,
+                chrom_idx,
+                unit,
+                resolution,
+                position,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -253,6 +380,46 @@ fn parse_index_key(key: &str) -> Result<(usize, usize)> {
         .parse::<usize>()
         .map_err(|e| Error::Format(format!("invalid chromosome index in '{key}': {e}")))?;
     Ok((c1, c2))
+}
+
+/// One normalization-vector entry from the footer index.
+struct NormEntry {
+    name: String,
+    chrom_idx: i32,
+    unit: String,
+    resolution: u32,
+    position: u64,
+}
+
+/// Number-of-values prefix shared by expected and normalization vectors.
+fn read_n_values(file: &mut File, version: i32) -> Result<i64> {
+    Ok(if version > 8 {
+        file.read_i64::<LittleEndian>()?
+    } else {
+        file.read_i32::<LittleEndian>()? as i64
+    })
+}
+
+/// Skip one expected-value-vector section (`normalized = false` is the raw
+/// expected vectors, `true` the normalized ones).
+fn skip_expected_section(file: &mut File, version: i32, normalized: bool) -> Result<()> {
+    let value_size: i64 = if version > 8 { 4 } else { 8 };
+    let n = file.read_i32::<LittleEndian>()?;
+    for _ in 0..n {
+        if normalized {
+            read_cstring(file)?; // normalization type
+        }
+        read_cstring(file)?; // unit
+        file.read_i32::<LittleEndian>()?; // resolution
+        let n_values = read_n_values(file, version)?;
+        file.seek(SeekFrom::Current(n_values * value_size))?; // skip values
+        let n_factors = file.read_i32::<LittleEndian>()?;
+        for _ in 0..n_factors {
+            file.read_i32::<LittleEndian>()?; // chromIdx
+            file.seek(SeekFrom::Current(value_size))?; // skip factor
+        }
+    }
+    Ok(())
 }
 
 /// Read the matrix metadata + block index for `entry` at `resolution`.
@@ -424,6 +591,18 @@ pub struct HicWriter {
     resolutions: Vec<u32>,
     /// Buffered pixels per resolution (symmetric-upper, global bin ids).
     buffers: BTreeMap<u32, Vec<Pixel>>,
+    /// Header attributes (key/value string pairs).
+    attributes: BTreeMap<String, String>,
+    /// Normalization vectors to write into the footer.
+    norms: Vec<NormVec>,
+}
+
+/// One normalization vector to write into the footer.
+struct NormVec {
+    resolution: u32,
+    name: String,
+    chrom: String,
+    values: Vec<f64>,
 }
 
 /// Chromosome-relative `(bin_x, bin_y, count)` records.
@@ -475,7 +654,42 @@ impl HicWriter {
             chroms: chroms.to_vec(),
             resolutions,
             buffers: BTreeMap::new(),
+            attributes: BTreeMap::new(),
+            norms: Vec::new(),
         })
+    }
+
+    /// Set the header attribute dictionary (written at [`HicWriter::finalize`]).
+    pub fn set_attributes(&mut self, attrs: &BTreeMap<String, String>) {
+        self.attributes = attrs.clone();
+    }
+
+    /// Buffer divisive normalization vectors for one resolution. `vectors` maps
+    /// each real chromosome name to its per-bin weights; the header index is
+    /// derived from `chroms` order (the `All` pseudo-chromosome is index 0).
+    pub fn add_normalization_vectors(
+        &mut self,
+        resolution: u32,
+        name: &str,
+        vectors: &[(String, Vec<f64>)],
+    ) -> Result<()> {
+        if !self.resolutions.contains(&resolution) {
+            return Err(Error::InvalidInput(format!(
+                "resolution {resolution} was not declared at creation"
+            )));
+        }
+        for (chrom, values) in vectors {
+            if !self.chroms.iter().any(|c| c.name == *chrom) {
+                return Err(Error::InvalidInput(format!("unknown chromosome '{chrom}'")));
+            }
+            self.norms.push(NormVec {
+                resolution,
+                name: name.to_string(),
+                chrom: chrom.clone(),
+                values: values.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Buffer pixels for one resolution.
@@ -533,7 +747,11 @@ impl HicWriter {
         header.write_i32::<LittleEndian>(8)?; // version
         header.write_i64::<LittleEndian>(0)?; // master index position (patched below)
         write_cstring(&mut header, &self.genome_id)?;
-        header.write_i32::<LittleEndian>(0)?; // nAttributes
+        header.write_i32::<LittleEndian>(self.attributes.len() as i32)?; // nAttributes
+        for (k, v) in &self.attributes {
+            write_cstring(&mut header, k)?;
+            write_cstring(&mut header, v)?;
+        }
         header.write_i32::<LittleEndian>((n_real + 1) as i32)?; // nChrs (incl All)
         write_cstring(&mut header, "All")?;
         header.write_i32::<LittleEndian>(all_length as i32)?;
@@ -578,21 +796,70 @@ impl HicWriter {
         let (pos, size) = self.write_matrix_body(0, 0, std::slice::from_ref(&all_spec))?;
         footers.push(("0_0".to_string(), pos, size));
 
-        // Footer (master index).
+        // Footer (master index + expected values + normalization vectors).
         let master_pos = self.file.stream_position()?;
-        let mut footer = Vec::new();
-        let mut nbytes: i32 = 4; // nEntries field
-        for (k, _, _) in &footers {
-            nbytes += k.len() as i32 + 1 + 8 + 4;
+
+        // Serialize normalization vector bodies; record their index entries.
+        let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(self.norms.len());
+        let mut norm_entries: Vec<(i32, u32, String, i32)> = Vec::new(); // (chrIdx, res, name, size)
+        for n in &self.norms {
+            let mut b = Vec::new();
+            b.write_i32::<LittleEndian>(n.values.len() as i32)?;
+            for &v in &n.values {
+                b.write_f64::<LittleEndian>(v)?;
+            }
+            let chr_idx = self
+                .chroms
+                .iter()
+                .position(|c| c.name == n.chrom)
+                .map(|i| (i + 1) as i32)
+                .unwrap_or(-1);
+            norm_entries.push((chr_idx, n.resolution, n.name.clone(), b.len() as i32));
+            bodies.push(b);
         }
-        footer.write_i32::<LittleEndian>(nbytes)?;
+
+        // Byte layout of the footer, so each vector body gets its file offset.
+        let mut master_index_size = 4i64; // nEntries
+        for (k, _, _) in &footers {
+            master_index_size += k.len() as i64 + 1 + 8 + 4;
+        }
+        let mut norm_index_size = 4i64; // nNormEntries
+        for (_, _, name, _) in &norm_entries {
+            // name(cstring) + chrIdx(4) + "BP"(cstring 3) + res(4) + pos(8) + size(4)
+            norm_index_size += name.len() as i64 + 1 + 4 + 3 + 4 + 8 + 4;
+        }
+        let body_start_offset = 4 + master_index_size + 8 + norm_index_size;
+        let mut body_offset = body_start_offset;
+        let mut positions = Vec::with_capacity(norm_entries.len());
+        for b in &bodies {
+            positions.push(master_pos as i64 + body_offset);
+            body_offset += b.len() as i64;
+        }
+        let total_footer = body_offset as i32;
+
+        let mut footer = Vec::new();
+        footer.write_i32::<LittleEndian>(total_footer)?; // nBytes
         footer.write_i32::<LittleEndian>(footers.len() as i32)?;
         for (k, pos, size) in &footers {
             write_cstring(&mut footer, k)?;
             footer.write_i64::<LittleEndian>(*pos)?;
             footer.write_i32::<LittleEndian>(*size)?;
         }
+        footer.write_i32::<LittleEndian>(0)?; // nExpectedValues
+        footer.write_i32::<LittleEndian>(0)?; // nExpectedValues (normalized)
+        footer.write_i32::<LittleEndian>(norm_entries.len() as i32)?;
+        for (i, (chr_idx, res, name, size)) in norm_entries.iter().enumerate() {
+            write_cstring(&mut footer, name)?;
+            footer.write_i32::<LittleEndian>(*chr_idx)?;
+            write_cstring(&mut footer, "BP")?;
+            footer.write_i32::<LittleEndian>(*res as i32)?;
+            footer.write_i64::<LittleEndian>(positions[i])?;
+            footer.write_i32::<LittleEndian>(*size)?;
+        }
         self.file.write_all(&footer)?;
+        for b in &bodies {
+            self.file.write_all(b)?;
+        }
 
         // Patch the master index position in the header.
         self.file.seek(SeekFrom::Start(8))?;

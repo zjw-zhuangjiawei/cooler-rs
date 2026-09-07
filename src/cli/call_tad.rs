@@ -14,9 +14,10 @@ use clap::{Args, ValueEnum};
 use rand::Rng;
 
 use cooler_rs::armatus;
+use cooler_rs::arrowhead;
 use cooler_rs::domaincaller::Chrom;
 use cooler_rs::ontad::{self, Params};
-use cooler_rs::{ChromMeta, Cooler, Error, Mcool};
+use cooler_rs::{ChromMeta, Cooler, Error, File, Mcool};
 
 /// TAD calling method.
 #[derive(Clone, Copy, ValueEnum)]
@@ -27,6 +28,8 @@ pub enum TadMethod {
     Domaincaller,
     /// Armatus 2.3 (Filippova et al., Algorithms Mol Biol 2014; Rust port)
     Armatus,
+    /// Arrowhead (Huntley & Durand, Cell Syst 2016; Rust port of juicer)
+    Arrowhead,
 }
 
 #[derive(Args)]
@@ -60,6 +63,9 @@ pub struct CallTadArgs {
 
     #[command(flatten)]
     armatus: ArmatusOptions,
+
+    #[command(flatten)]
+    arrowhead: ArrowheadOptions,
 }
 
 /// Options specific to `--method ontad`.
@@ -153,19 +159,55 @@ impl ArmatusOptions {
     }
 }
 
+/// Options specific to `--method arrowhead`.
+#[derive(Args)]
+struct ArrowheadOptions {
+    /// Normalization to apply (bins column for .cool, norm type for .hic; NONE = raw)
+    #[arg(long, value_name = "NAME", help_heading = "Arrowhead options")]
+    norm: Option<String>,
+
+    /// Sliding-window width along the diagonal, in bins
+    #[arg(long, value_name = "N", help_heading = "Arrowhead options")]
+    window: Option<usize>,
+
+    /// High-confidence variance threshold
+    #[arg(long, value_name = "F", help_heading = "Arrowhead options")]
+    var_threshold: Option<f64>,
+
+    /// High-confidence sign threshold
+    #[arg(long, value_name = "F", help_heading = "Arrowhead options")]
+    high_sign: Option<f64>,
+
+    /// Minimum domain width, in bins
+    #[arg(long, value_name = "N", help_heading = "Arrowhead options")]
+    min_block_size: Option<usize>,
+
+    /// Upstream/downstream gap for the directionality index
+    #[arg(long, value_name = "N", help_heading = "Arrowhead options")]
+    gap: Option<usize>,
+}
+
+impl ArrowheadOptions {
+    fn params(&self) -> arrowhead::Params {
+        arrowhead::Params {
+            matrix_width: self.window.unwrap_or(2000),
+            var_threshold: Some(self.var_threshold.unwrap_or(0.2)),
+            high_sign_threshold: self.high_sign.unwrap_or(0.5),
+            min_block_size: self.min_block_size.unwrap_or(60),
+            gap: self.gap.unwrap_or(7),
+            ..Default::default()
+        }
+    }
+}
+
 pub fn run(args: CallTadArgs) -> cooler_rs::Result<()> {
     let fin = args.input.display().to_string();
-
-    if fin.ends_with(".hic") {
-        return Err(Error::InvalidInput(
-            ".hic input is not supported; convert to .cool first".into(),
-        ));
-    }
 
     match args.method {
         TadMethod::Ontad => run_ontad(&args, &fin),
         TadMethod::Domaincaller => run_domaincaller(&args, &fin),
         TadMethod::Armatus => run_armatus(&args, &fin),
+        TadMethod::Arrowhead => run_arrowhead(&args, &fin),
     }
 }
 
@@ -430,4 +472,71 @@ fn run_ontad(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     log::info!("Total run time: {:.1?}", t0.elapsed());
 
     Ok(())
+}
+
+fn run_arrowhead(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
+    let params = args.arrowhead.params();
+    let norm = args.arrowhead.norm.as_deref();
+    log::info!(
+        "Arrowhead (Rust port of juicer): window={}, var={:?}, high_sign={}, min_block_size={}, norm={:?}",
+        params.matrix_width,
+        params.var_threshold,
+        params.high_sign_threshold,
+        params.min_block_size,
+        norm
+    );
+    let t0 = Instant::now();
+
+    let res = resolve_arrowhead_resolution(args, fin)?;
+    let f = File::open(fin, res)?;
+    let chroms: Option<Vec<String>> = args.chr.clone().map(|c| vec![c]);
+    let domains = arrowhead::call_domains(&f, norm, &params, chroms.as_deref())?;
+
+    let prefix = args.output.as_deref().unwrap_or(fin);
+    let fout = format!("{prefix}.arrowhead.bedpe");
+    let mut out = std::fs::File::create(&fout)?;
+    for d in &domains {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}",
+            d.chrom,
+            d.start,
+            d.end,
+            d.chrom,
+            d.start,
+            d.end,
+            d.score,
+            d.up_var,
+            d.lo_var,
+            d.up_sign,
+            d.lo_sign
+        )?;
+    }
+
+    log::info!("Called {} domains ({:.1?})", domains.len(), t0.elapsed());
+    log::info!("Output to {fout}");
+    Ok(())
+}
+
+fn resolve_arrowhead_resolution(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<u32> {
+    if let Some(r) = args.res {
+        return Ok(r as u32);
+    }
+    if fin.ends_with(".hic") {
+        return Err(Error::InvalidInput(
+            "arrowhead on .hic input needs --res (bp resolution)".into(),
+        ));
+    }
+    if fin.ends_with(".mcool") {
+        let mcool = Mcool::open(fin)?;
+        return match mcool.resolutions()?.as_slice() {
+            [only] => Ok(*only as u32),
+            _ => Err(Error::InvalidInput(
+                ".mcool contains multiple resolutions; select one with --res".into(),
+            )),
+        };
+    }
+    Ok(Cooler::open_any(fin)?
+        .bin_size()?
+        .ok_or_else(|| Error::Format("missing 'bin-size' attribute".into()))? as u32)
 }

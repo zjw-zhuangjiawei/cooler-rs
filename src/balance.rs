@@ -7,6 +7,8 @@
 
 use crate::cooler::Cooler;
 use crate::error::Result;
+use crate::file::File;
+use crate::types::{MatrixSource, Pixel, Weights};
 
 /// Parameters for [`balance_cooler`], mirroring the defaults of the Python
 /// `cooler.balance.balance_cooler`.
@@ -108,8 +110,8 @@ fn partition(start: usize, stop: usize, step: usize) -> Vec<(usize, usize)> {
 /// `_zero_cis` / `_zero_diags` → `_timesouterproduct` → `_marginalize`.
 /// Pixel streams are read in stored order, so summation order matches Python.
 #[allow(clippy::too_many_arguments)]
-fn accumulate_marginal(
-    clr: &Cooler,
+fn accumulate_marginal<S: MatrixSource>(
+    clr: &S,
     bin_chrom: &[i32],
     spans: &[(usize, usize)],
     binarize: bool,
@@ -167,8 +169,8 @@ fn nz_mean_var(marg: &[f64]) -> Option<(f64, f64)> {
 
 // Parameter count mirrors the Python `_balance_*` signatures.
 #[allow(clippy::too_many_arguments)]
-fn converge(
-    clr: &Cooler,
+fn converge<S: MatrixSource>(
+    clr: &S,
     bin_chrom: &[i32],
     spans: &[(usize, usize)],
     zero_trans: bool,
@@ -247,8 +249,8 @@ fn converge(
 
 /// Genome-wide iterative correction (`_balance_genomewide`).
 #[allow(clippy::too_many_arguments)]
-fn balance_genomewide(
-    clr: &Cooler,
+fn balance_genomewide<S: MatrixSource>(
+    clr: &S,
     bin_chrom: &[i32],
     spans: &[(usize, usize)],
     zero_trans: bool,
@@ -284,8 +286,8 @@ fn balance_genomewide(
 
 /// Trans-only iterative correction (`_balance_transonly`).
 #[allow(clippy::too_many_arguments)]
-fn balance_transonly(
-    clr: &Cooler,
+fn balance_transonly<S: MatrixSource>(
+    clr: &S,
     bin_chrom: &[i32],
     spans: &[(usize, usize)],
     chrom_offset: &[i64],
@@ -330,8 +332,8 @@ fn balance_transonly(
 /// (`_balance_cisonly`). Returns per-chromosome scale, variance and
 /// convergence flags.
 #[allow(clippy::too_many_arguments)]
-fn balance_cisonly(
-    clr: &Cooler,
+fn balance_cisonly<S: MatrixSource>(
+    clr: &S,
     bin_chrom: &[i32],
     chrom_offset: &[i64],
     bin1_offset: &[i64],
@@ -419,10 +421,13 @@ fn balance_cisonly(
 /// Returns the bin bias vector (`N[i, j] = O[i, j] * bias[i] * bias[j]`;
 /// dropped bins are `NaN`) and a [`BalanceStats`] summary. See
 /// [`BalanceParams`] for the tunables.
-pub fn balance_cooler(clr: &Cooler, p: &BalanceParams) -> Result<(Vec<f64>, BalanceStats)> {
+pub(crate) fn balance_impl<S: MatrixSource>(
+    clr: &S,
+    p: &BalanceParams,
+) -> Result<(Vec<f64>, BalanceStats)> {
     let nnz = clr.n_pixels()? as usize;
     let spans = partition(0, nnz, p.chunksize);
-    let n_bins = clr.bins()?.len();
+    let n_bins = clr.n_bins()?;
     let bin_chrom = clr.bin_chrom()?;
 
     let mut bias = match &p.x0 {
@@ -589,6 +594,101 @@ pub fn balance_cooler(clr: &Cooler, p: &BalanceParams) -> Result<(Vec<f64>, Bala
     };
 
     Ok((bias, stats))
+}
+
+/// Iterative correction of a single-resolution `.cool` file (see
+/// [`BalanceParams`]). Thin wrapper over the generic core.
+pub fn balance_cooler(clr: &Cooler, p: &BalanceParams) -> Result<(Vec<f64>, BalanceStats)> {
+    balance_impl(clr, p)
+}
+
+impl MatrixSource for Cooler {
+    fn n_pixels(&self) -> Result<u64> {
+        Cooler::n_pixels(self)
+    }
+
+    fn n_bins(&self) -> Result<usize> {
+        Ok(self.bins()?.len())
+    }
+
+    fn bin_chrom(&self) -> Result<Vec<i32>> {
+        Cooler::bin_chrom(self)
+    }
+
+    fn chrom_offset(&self) -> Result<Vec<i64>> {
+        Cooler::chrom_offset(self)
+    }
+
+    fn bin1_offset(&self) -> Result<Vec<i64>> {
+        Cooler::bin1_offset(self)
+    }
+
+    fn pixels_range(&self, lo: i64, hi: i64) -> Result<Vec<Pixel>> {
+        Cooler::pixels_range(self, lo, hi)
+    }
+}
+
+/// Vanilla-coverage weights: `bias_i = sqrt(marginal_i)`, divisive (juicer
+/// "VC"). The marginal is the row+column sum over all pixels.
+pub fn vc_weights(f: &File, cis_only: bool) -> Result<Weights> {
+    let bins = f.bins()?;
+    let n = bins.len();
+    let bin_chrom: Vec<i32> = bins.iter().map(|b| b.chrom_id).collect();
+    let mut marg = vec![0.0f64; n];
+    for p in f.pixels()? {
+        let b1 = p.bin1_id as usize;
+        let b2 = p.bin2_id as usize;
+        if cis_only && bin_chrom[b1] != bin_chrom[b2] {
+            continue;
+        }
+        marg[b1] += p.count;
+        marg[b2] += p.count;
+    }
+    let bias: Vec<f64> = marg.iter().map(|&m| m.sqrt()).collect();
+    Ok(Weights {
+        values: bias,
+        divisive: true,
+    })
+}
+
+/// VC_SQRT: `bias_i = marginal_i^(1/4)`, divisive.
+pub fn vc_sqrt_weights(f: &File, cis_only: bool) -> Result<Weights> {
+    let bins = f.bins()?;
+    let n = bins.len();
+    let bin_chrom: Vec<i32> = bins.iter().map(|b| b.chrom_id).collect();
+    let mut marg = vec![0.0f64; n];
+    for p in f.pixels()? {
+        let b1 = p.bin1_id as usize;
+        let b2 = p.bin2_id as usize;
+        if cis_only && bin_chrom[b1] != bin_chrom[b2] {
+            continue;
+        }
+        marg[b1] += p.count;
+        marg[b2] += p.count;
+    }
+    let bias: Vec<f64> = marg.iter().map(|&m| m.sqrt().sqrt()).collect();
+    Ok(Weights {
+        values: bias,
+        divisive: true,
+    })
+}
+
+/// Knight-Ruiz (Sinkhorn-Knopp) weights: reuse the iterative-correction core
+/// with all pre-filters disabled. Multiplicative (`N = O * w_i * w_j`), matching
+/// [`balance_cooler`].
+pub fn kr_weights(f: &File) -> Result<Weights> {
+    let p = BalanceParams {
+        mad_max: 0,
+        min_nnz: 0,
+        min_count: 0,
+        ignore_diags: 0,
+        ..Default::default()
+    };
+    let (bias, _stats) = balance_impl(f, &p)?;
+    Ok(Weights {
+        values: bias,
+        divisive: false,
+    })
 }
 
 /// Median of a slice. Mirrors `np.median` for odd lengths; the Python MAD-max

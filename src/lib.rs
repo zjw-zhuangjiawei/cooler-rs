@@ -37,12 +37,14 @@
 //! ```
 
 pub mod armatus;
+pub mod arrowhead;
 pub mod balance;
 pub mod compare;
 pub mod convert;
 pub mod cooler;
 pub mod domaincaller;
 pub mod error;
+pub mod file;
 pub mod hic;
 pub mod mcool;
 pub mod ontad;
@@ -53,20 +55,23 @@ pub mod types;
 pub mod zoomify;
 
 pub use armatus::{call_domains, Domain};
-pub use balance::{balance_cooler, BalanceParams, BalanceStats};
+pub use balance::{
+    balance_cooler, kr_weights, vc_sqrt_weights, vc_weights, BalanceParams, BalanceStats,
+};
 pub use compare::{compare_pair, CompareMetric, CompareParams};
 pub use cooler::{
     delete_bins_column, rename_chroms, write_bins_column, AttrValue, Cooler, CoolerWriter,
     SubMatrix, Validation,
 };
 pub use error::{Error, Result};
+pub use file::File;
 pub use hic::{HiCFile, HicWriter};
 pub use mcool::{Mcool, McoolWriter};
 pub use ontad::{Params, Tad};
 pub use raichu::{raichu_normalize, RaichuParams};
 pub use region::Region;
 pub use stats::{DiscreteDistribution, GeneralMixtureModel, HiddenMarkovModel, NormalDistribution};
-pub use types::{Bin, Chrom, ChromMeta, Pixel};
+pub use types::{Bin, Chrom, ChromMeta, Pixel, Weights};
 pub use zoomify::{
     coarsen_pixels, nice_resolutions, pow2_resolutions, zoomify_cooler, ZoomifyParams,
 };

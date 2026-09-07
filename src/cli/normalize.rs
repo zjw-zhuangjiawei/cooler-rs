@@ -1,26 +1,35 @@
 //! `cooler-rs normalize` — contact matrix normalization.
 //!
-//! `--method ic` (default) is iterative correction, a port of
-//! `cooler.cli.balance`; `--method raichu` is the Raichu sliding-window
-//! optimizer, a port of RaichuNorm v1.1. Both write a per-bin bias column back
-//! to the input `.cool`/`.mcool` file (or print it to stdout with `--stdout`).
+//! Methods: `ice` (iterative correction, a port of `cooler.cli.balance`),
+//! `kr`/`vc`/`vc_sqrt` (juicer-style weights), and `raichu` (RaichuNorm
+//! sliding-window optimizer). All write a per-bin weight column back to the
+//! input `.cool`/`.mcool` file (`ice` can print to stdout with `--stdout`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 use cooler_rs::{
-    balance_cooler, raichu_normalize, write_bins_column, AttrValue, BalanceParams, Cooler, Error,
-    Mcool, RaichuParams,
+    balance_cooler, kr_weights, raichu_normalize, vc_sqrt_weights, vc_weights, write_bins_column,
+    AttrValue, BalanceParams, Cooler, Error, File, Mcool, RaichuParams,
 };
 
 /// Normalization method.
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Method {
-    /// Iterative correction (port of `cooler balance`)
-    Ic,
+    /// ICE — iterative correction (port of `cooler balance`)
+    Ice,
     /// Raichu sliding-window normalization (port of RaichuNorm)
     Raichu,
+    /// Knight-Ruiz (Sinkhorn-Knopp) balancing
+    #[value(name = "kr")]
+    Kr,
+    /// Vanilla coverage
+    #[value(name = "vc")]
+    Vc,
+    /// Vanilla coverage sqrt
+    #[value(name = "vc_sqrt")]
+    VcSqrt,
 }
 
 #[derive(Args)]
@@ -30,15 +39,15 @@ pub struct NormalizeArgs {
     input: PathBuf,
 
     /// Normalization method
-    #[arg(long, value_enum, value_name = "METHOD", default_value = "ic")]
+    #[arg(long, value_enum, value_name = "METHOD", default_value = "ice")]
     method: Method,
 
     /// Resolution to normalize (.mcool input)
     #[arg(long, value_name = "N")]
     res: Option<u64>,
 
-    /// Name of the column to write to (default: 'weight' for ic,
-    /// 'obj_weight' for raichu)
+    /// Name of the column to write to (default: 'weight' for ice,
+    /// 'obj_weight' for raichu, 'KR'/'VC'/'VC_SQRT' for kr/vc/vc_sqrt)
     #[arg(short = 'n', long, value_name = "NAME")]
     name: Option<String>,
 
@@ -67,7 +76,7 @@ pub struct NormalizeArgs {
     raichu: RaichuOptions,
 }
 
-/// Options for `--method ic` (iterative correction).
+/// Options for `--method ice` (iterative correction).
 #[derive(Args)]
 struct IcOptions {
     /// Calculate weights against intra-chromosomal data only
@@ -300,12 +309,70 @@ fn load_bed(path: &Path, bin_size: u64) -> cooler_rs::Result<HashMap<String, Vec
 pub fn run(args: NormalizeArgs) -> cooler_rs::Result<()> {
     let _ = args.nproc; // accepted for CLI compatibility; single-threaded
     match args.method {
-        Method::Ic => run_ic(&args),
+        Method::Ice => run_ice(&args),
         Method::Raichu => run_raichu(&args),
+        Method::Kr => run_weights(&args, WeightKind::Kr),
+        Method::Vc => run_weights(&args, WeightKind::Vc),
+        Method::VcSqrt => run_weights(&args, WeightKind::VcSqrt),
     }
 }
 
-fn run_ic(args: &NormalizeArgs) -> cooler_rs::Result<()> {
+enum WeightKind {
+    Kr,
+    Vc,
+    VcSqrt,
+}
+
+fn run_weights(args: &NormalizeArgs, kind: WeightKind) -> cooler_rs::Result<()> {
+    let cool_path = args.input.display().to_string();
+    let name = args.name.clone().unwrap_or_else(|| {
+        match kind {
+            WeightKind::Kr => "KR",
+            WeightKind::Vc => "VC",
+            WeightKind::VcSqrt => "VC_SQRT",
+        }
+        .into()
+    });
+
+    let (clr, group_path) = resolve_cooler(&args.input, args.res)?;
+
+    if clr.bins_has_column(&name)? && !args.force {
+        return Err(Error::InvalidInput(format!(
+            "'{name}' column already exists. Use --force option to overwrite."
+        )));
+    }
+
+    let file = File::Cooler(clr);
+    let weights = match kind {
+        WeightKind::Kr => kr_weights(&file)?,
+        WeightKind::Vc => vc_weights(&file, false)?,
+        WeightKind::VcSqrt => vc_sqrt_weights(&file, false)?,
+    };
+    // cooler `bins` columns are multiplicative; divisive weights -> 1/bias.
+    let bias: Vec<f64> = if weights.divisive {
+        weights
+            .values
+            .iter()
+            .map(|&w| if w == 0.0 { f64::NAN } else { 1.0 / w })
+            .collect()
+    } else {
+        weights.values
+    };
+    drop(file);
+
+    let attrs: Vec<(&str, AttrValue)> = vec![("divisive_weights", AttrValue::I64(0))];
+    write_bins_column(&args.input, &group_path, &name, &bias, &attrs)?;
+    log::info!(
+        "Wrote {n} weights to '{input}'::{group} bins/{name}",
+        n = bias.len(),
+        input = cool_path,
+        group = group_path,
+        name = name
+    );
+    Ok(())
+}
+
+fn run_ice(args: &NormalizeArgs) -> cooler_rs::Result<()> {
     let cool_path = args.input.display().to_string();
     let name = args.name.clone().unwrap_or_else(|| "weight".into());
     let ignore_diags = args.ignore_diags.unwrap_or(2);

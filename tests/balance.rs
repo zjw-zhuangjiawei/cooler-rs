@@ -112,7 +112,10 @@
 
 use std::path::Path;
 
-use cooler_rs::{balance_cooler, BalanceParams, Chrom, Cooler, CoolerWriter, Pixel};
+use cooler_rs::{
+    balance_cooler, kr_weights, vc_weights, BalanceParams, Chrom, Cooler, CoolerWriter, File,
+    Pixel, Weights,
+};
 
 /// Typed view of `tests/data/syn.balance.cooler-python.json` (see the
 /// "Expected fixture" section in the module docs for how it is generated): the
@@ -592,4 +595,78 @@ fn matches_python_cooler_fixtures() {
             );
         }
     }
+}
+
+/// VC weights equal the square root of the raw marginal (divisive); KR matches
+/// the no-filter `balance_cooler` (multiplicative); `Weights::apply` honors the
+/// divisive flag. Exercised through the unified `File` read surface.
+#[test]
+fn vc_kr_and_weights_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.cool");
+    let chroms = vec![Chrom {
+        name: "chr1".into(),
+        length: 300_000,
+    }];
+    // 3x3 upper triangle with uneven marginals: [3, 4, 5].
+    let pixels = vec![
+        Pixel {
+            bin1_id: 0,
+            bin2_id: 1,
+            count: 1.0,
+        },
+        Pixel {
+            bin1_id: 0,
+            bin2_id: 2,
+            count: 2.0,
+        },
+        Pixel {
+            bin1_id: 1,
+            bin2_id: 2,
+            count: 3.0,
+        },
+    ];
+    let writer = CoolerWriter::create(&path, &chroms, 100_000).unwrap();
+    writer.write_pixels(&pixels).unwrap();
+
+    let f = File::open(path.to_str().unwrap(), 100_000).unwrap();
+
+    // VC: bias = sqrt(marginal), divisive.
+    let vc = vc_weights(&f, false).unwrap();
+    assert!(vc.divisive);
+    for (i, &m) in [3.0f64, 4.0, 5.0].iter().enumerate() {
+        assert!((vc.values[i] - m.sqrt()).abs() < 1e-12, "bin {i}");
+    }
+
+    // KR: multiplicative, equal to balance_cooler with no filters.
+    let kr = kr_weights(&f).unwrap();
+    assert!(!kr.divisive);
+    let p = BalanceParams {
+        min_nnz: 0,
+        min_count: 0,
+        mad_max: 0,
+        ignore_diags: 0,
+        ..Default::default()
+    };
+    let (bias, _) = balance_cooler(&Cooler::open(&path).unwrap(), &p).unwrap();
+    for (i, (&k, &b)) in kr.values.iter().zip(bias.iter()).enumerate() {
+        assert!((k - b).abs() < 1e-12, "bin {i}");
+    }
+
+    // Weights::apply: divisive vs multiplicative.
+    let px = Pixel {
+        bin1_id: 0,
+        bin2_id: 1,
+        count: 12.0,
+    };
+    let div = Weights {
+        values: vec![2.0, 3.0, 5.0],
+        divisive: true,
+    };
+    assert!((div.apply(&px) - 12.0 / (2.0 * 3.0)).abs() < 1e-12);
+    let mul = Weights {
+        values: vec![2.0, 3.0, 5.0],
+        divisive: false,
+    };
+    assert!((mul.apply(&px) - 12.0 * 2.0 * 3.0).abs() < 1e-12);
 }
