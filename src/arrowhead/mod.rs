@@ -153,29 +153,36 @@ fn directionality_index_upstream(observed: &Array2<f64>, gap: usize) -> Array2<f
     d_up
 }
 
-/// Fetch a dense symmetric `n x n` window (`lo..hi`, bins local to `chrom`)
-/// at `res`, normalized by `norm` when given.
+/// Fetch a dense `n x n` window. `lo` is the chromosome-local bin where the
+/// window starts; the window spans bins `lo..lo + n` (`n` is the full matrix
+/// width, juicer's `limEnd - adjustedLimStart + 1`), so bins past the real end
+/// of the chromosome simply stay zero — exactly the padding juicer reads into
+/// its oversized final window.
 ///
 /// `bin_offset` is the number of bins before `chrom` in the file's global bin
 /// ordering. Pixels returned by `File::fetch` carry global bin ids, so a
-/// chromosome's window (`lo`/`hi` local) must be shifted by `bin_offset`
-/// before matching, then shifted back to place the pixel in the window.
+/// chromosome's window (`lo` local) must be shifted by `bin_offset` before
+/// matching, then shifted back to place the pixel in the window.
 #[allow(clippy::too_many_arguments)]
 fn fetch_window_matrix(
     f: &File,
     chrom: &str,
     res: u64,
     lo: i64,
-    hi: i64,
+    n: i64,
     chrom_len: u64,
     bin_offset: usize,
     norm: Option<&str>,
 ) -> Result<Array2<f64>> {
-    let region = Region::range(chrom, lo as u64 * res, (hi as u64 * res).min(chrom_len));
+    let region = Region::range(
+        chrom,
+        lo as u64 * res,
+        ((lo + n) as u64 * res).min(chrom_len),
+    );
     let pixels = f.fetch(&region, norm)?;
-    let n = (hi - lo) as usize;
+    let n = n as usize;
     let win_start = bin_offset as i64 + lo;
-    let win_end = bin_offset as i64 + hi;
+    let win_end = win_start + n as i64;
     let mut m = Array2::zeros((n, n));
     for p in &pixels {
         if p.bin1_id >= win_start
@@ -207,26 +214,30 @@ fn block_results(
     tri.calculate_results(&components)
 }
 
-/// The diagonal windows of one pass, as `(lo, hi)` bin half-open ranges in
-/// global bin ids (juicer `BlockBuster.run` windowing).
+/// The diagonal windows of one pass, as `(lim_start, n)` (juicer
+/// `BlockBuster.run` windowing, mirrored exactly).
+///
+/// The slide steps by `matrix_width / 2`. Every window is read from its
+/// `lim_start` (never backed off) and sized `n = lim_end - adjusted + 1` with
+/// juicer's `adjusted` back-off — which only feeds the matrix *dimension*, not
+/// the region start, so each window is zero-padded beyond the real bins and
+/// domains are placed by offsetting by `lim_start`. Faithfully reproducing
+/// this is required for bit-parity: our former "true-start" back-off gave the
+/// tail window a second look at bins the preceding step-window already scored,
+/// which shifted merged scores.
 fn window_ranges(n_bins: usize, matrix_width: usize) -> Vec<(usize, usize)> {
     let increment = matrix_width / 2;
     let mut out = Vec::new();
     let mut lim_start = 0usize;
     while lim_start < n_bins {
-        let lim_end_incl = (lim_start + matrix_width).min(n_bins);
-        // juicer backs the final window off so the tail is scanned at full
-        // width, overlapping the previous window.
-        let lo = if lim_end_incl == n_bins && n_bins > increment {
+        let lim_end = (lim_start + matrix_width).min(n_bins);
+        let adjusted = if lim_end == n_bins && n_bins > increment {
             n_bins.saturating_sub(matrix_width)
         } else {
             lim_start
         };
-        let hi = (lim_end_incl + 1).min(n_bins);
-        if hi <= lo {
-            break;
-        }
-        out.push((lo, hi));
+        let n = lim_end.saturating_sub(adjusted) + 1;
+        out.push((lim_start, n));
         lim_start += increment;
     }
     out
@@ -255,19 +266,17 @@ fn call_sub_blockbuster(
     let windows = window_ranges(n_bins, params.matrix_width);
     let per_window: Result<Vec<Vec<HighScore>>> = windows
         .par_iter()
-        .map(|&(lo, hi)| {
+        .map(|&(lo, n)| {
             let observed = fetch_window_matrix(
-                f, chrom, res, lo as i64, hi as i64, chrom_len, bin_offset, norm,
+                f, chrom, res, lo as i64, n as i64, chrom_len, bin_offset, norm,
             )?;
             let mut window = block_results(&observed, var_threshold, sign_threshold, gap);
+            // Juicer offsets each window's results by its `limStart`.
             for s in &mut window {
-                // Offset by the true window start (juicer offsets by `limStart`,
-                // which misplaces the final window's domains; see plan).
                 s.offset_index(lo as i64);
             }
             log::debug!(
-                "    [{chrom}] window [{lo},{hi}): {} bins, {} blocks",
-                hi - lo,
+                "    [{chrom}] window at bin {lo}: {n} bins, {} blocks",
                 window.len()
             );
             Ok(window)
