@@ -368,10 +368,86 @@ fn run_armatus(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     );
     let t0 = Instant::now();
 
-    let (cool, first, last, meta) = open_cooler(args, fin)?;
-    let res = meta.resolution as usize;
-    let n = last - first;
+    let prefix = args.output.as_deref().unwrap_or(fin);
 
+    if let Some(_chr) = args.chr.as_deref() {
+        let (cool, first, last, meta) = open_cooler(args, fin)?;
+        let res = meta.resolution as usize;
+        log::info!(" Loaded {meta} bins", meta = last - first);
+        let (domains, ensemble) = armatus_for_chrom(&cool, first, last, args.armatus.log, &params)?;
+        let fout = format!("{prefix}.consensus.txt");
+        write_domains_bed(&fout, &[(meta.name.as_str(), &domains)], res)?;
+        if args.armatus.multiscale {
+            write_multiscale(prefix, &[(meta.name.as_str(), ensemble)], res, params.top_k)?;
+        }
+        log::info!(" Called {} domains ({:.1?})", domains.len(), t0.elapsed());
+        log::info!("Output to {fout}");
+        return Ok(());
+    }
+
+    // Whole-genome: iterate every chromosome in input order. The per-chrom
+    // matrices are dense (n*n f64); skipping huge chroms is the caller's job
+    // (--chr). We keep this serial — the matrix allocation per chromosome is
+    // the bottleneck, and parallelism would just multiply peak memory.
+    let cool = open_cooler_file(args, fin)?;
+    let chroms = cool.chroms()?;
+    let offsets = cool.chrom_offset()?;
+    let res =
+        cool.bin_size()?
+            .ok_or_else(|| Error::Format("missing 'bin-size' attribute".into()))? as usize;
+    let n = chroms.len();
+    log::info!(" Whole-genome armatus: {n} chromosomes at {res} bp/res");
+
+    let fout = format!("{prefix}.consensus.txt");
+    let mut consensus = std::fs::File::create(&fout)?;
+    let mut total = 0usize;
+    let mut multi_buf: Vec<(&str, armatus::WeightedDomainEnsemble)> = Vec::new();
+    for (i, chrom) in chroms.iter().enumerate() {
+        let first = offsets[i] as usize;
+        let last = offsets[i + 1] as usize;
+        if first == last {
+            log::info!(" [{}/{}] {} (empty, skipped)", i + 1, n, chrom.name);
+            continue;
+        }
+        log::info!(" [{}/{}] {}: {} bins", i + 1, n, chrom.name, last - first);
+        let (domains, ensemble) = armatus_for_chrom(&cool, first, last, args.armatus.log, &params)?;
+        total += domains.len();
+        for d in &domains {
+            writeln!(
+                consensus,
+                "{}\t{}\t{}",
+                chrom.name,
+                d.start * res,
+                (d.end + 1) * res - 1
+            )?;
+        }
+        if args.armatus.multiscale {
+            multi_buf.push((chrom.name.as_str(), ensemble));
+        }
+    }
+
+    if args.armatus.multiscale && !multi_buf.is_empty() {
+        write_multiscale(prefix, &multi_buf, res, params.top_k)?;
+    }
+
+    log::info!(
+        " Called {total} domains across {n} chromosomes ({:.1?})",
+        t0.elapsed()
+    );
+    log::info!("Output to {fout}");
+    Ok(())
+}
+
+/// Build the dense symmetric matrix for `[first, last)`, optionally log the
+/// positive counts, then run the multiscale sweep + consensus extraction.
+fn armatus_for_chrom(
+    cool: &Cooler,
+    first: usize,
+    last: usize,
+    log_flag: bool,
+    params: &armatus::Params,
+) -> cooler_rs::Result<(Vec<armatus::Domain>, armatus::WeightedDomainEnsemble)> {
+    let n = last - first;
     // Full symmetric dense matrix (Armatus sums over whole sub-matrices, so
     // no band is applied).
     let mut x = ndarray::Array2::<f64>::zeros((n, n));
@@ -383,51 +459,61 @@ fn run_armatus(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
             x[[b2 - first, b1 - first]] = v;
         }
     }
-    if args.armatus.log {
+    if log_flag {
         for v in x.iter_mut() {
             if *v > 0.0 {
                 *v = v.ln();
             }
         }
     }
-    log::info!(" Loaded {n} bins ({res} bp/res)");
-
-    let ensemble = armatus::multiscale_domains(&x, &params);
+    let ensemble = armatus::multiscale_domains(&x, params);
     let domains = armatus::consensus_domains(&ensemble);
+    Ok((domains, ensemble))
+}
 
-    let prefix = args.output.as_deref().unwrap_or(fin);
-    let fout = format!("{prefix}.consensus.txt");
-    let mut out = std::fs::File::create(&fout)?;
-    for d in &domains {
-        writeln!(
-            out,
-            "{}\t{}\t{}",
-            meta.name,
-            d.start * res,
-            (d.end + 1) * res - 1
-        )?;
-    }
-
-    if args.armatus.multiscale {
-        for (i, dset) in ensemble.domain_sets.iter().enumerate() {
-            let gamma = ensemble.resolutions[i];
-            let opt_idx = i % params.top_k;
-            let fmulti = format!("{prefix}.gamma.{gamma}.{opt_idx}.txt");
-            let mut f = std::fs::File::create(&fmulti)?;
-            for d in dset {
-                writeln!(
-                    f,
-                    "{}\t{}\t{}",
-                    meta.name,
-                    d.start * res,
-                    (d.end + 1) * res - 1
-                )?;
-            }
+fn write_domains_bed(
+    path: &str,
+    rows: &[(&str, &[armatus::Domain])],
+    res: usize,
+) -> cooler_rs::Result<()> {
+    let mut out = std::fs::File::create(path)?;
+    for (chrom, domains) in rows {
+        for d in *domains {
+            writeln!(
+                out,
+                "{}\t{}\t{}",
+                chrom,
+                d.start * res,
+                (d.end + 1) * res - 1
+            )?;
         }
     }
+    Ok(())
+}
 
-    log::info!(" Called {} domains ({:.1?})", domains.len(), t0.elapsed());
-    log::info!("Output to {fout}");
+/// Write per-(chrom, gamma, top-k) domain files. Filenames for single-chrom
+/// runs match the original `{prefix}.gamma.{g}.{k}.txt`; multi-chrom runs
+/// insert the chromosome between prefix and gamma to avoid clobbering across
+/// chromosomes.
+fn write_multiscale(
+    prefix: &str,
+    rows: &[(&str, armatus::WeightedDomainEnsemble)],
+    res: usize,
+    top_k: usize,
+) -> cooler_rs::Result<()> {
+    let multi = rows.len() > 1;
+    for (chrom, ensemble) in rows {
+        for (i, dset) in ensemble.domain_sets.iter().enumerate() {
+            let gamma = ensemble.resolutions[i];
+            let opt_idx = i % top_k;
+            let path = if multi {
+                format!("{prefix}.{chrom}.gamma.{gamma}.{opt_idx}.txt")
+            } else {
+                format!("{prefix}.gamma.{gamma}.{opt_idx}.txt")
+            };
+            write_domains_bed(&path, &[(chrom, dset)], res)?;
+        }
+    }
     Ok(())
 }
 
