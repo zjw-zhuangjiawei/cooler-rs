@@ -756,7 +756,7 @@ impl HicWriter {
             write_cstring(&mut header, v)?;
         }
         header.write_i32::<LittleEndian>((n_real + 1) as i32)?; // nChrs (incl All)
-        write_cstring(&mut header, "All")?;
+        write_cstring(&mut header, "ALL")?;
         header.write_i32::<LittleEndian>(all_length as i32)?;
         for c in &self.chroms {
             write_cstring(&mut header, &c.name)?;
@@ -838,10 +838,16 @@ impl HicWriter {
             positions.push(master_pos as i64 + body_offset);
             body_offset += b.len() as i64;
         }
-        let total_footer = body_offset as i32;
+        // The first footer int is the size of the "v5" window (master index +
+        // the raw expected-value section) that juicer's DatasetReaderV2 reads
+        // as one buffer; the normalized-expected section, norm index, and
+        // vector arrays follow it and are parsed from the live stream. Writing
+        // the whole footer length here makes juicer seek past the norm index
+        // and hit EOF while parsing it, silently discarding all norm vectors.
+        let footer_v5_size = (master_index_size + 4) as i32; // + raw nExpectedValues int (zero entries)
 
         let mut footer = Vec::new();
-        footer.write_i32::<LittleEndian>(total_footer)?; // nBytes
+        footer.write_i32::<LittleEndian>(footer_v5_size)?; // nBytesV5
         footer.write_i32::<LittleEndian>(footers.len() as i32)?;
         for (k, pos, size) in &footers {
             write_cstring(&mut footer, k)?;
