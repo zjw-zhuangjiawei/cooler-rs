@@ -153,8 +153,14 @@ fn directionality_index_upstream(observed: &Array2<f64>, gap: usize) -> Array2<f
     d_up
 }
 
-/// Fetch a dense symmetric `n x n` window (`lo..hi` global bins) at `res`,
-/// normalized by `norm` when given.
+/// Fetch a dense symmetric `n x n` window (`lo..hi`, bins local to `chrom`)
+/// at `res`, normalized by `norm` when given.
+///
+/// `bin_offset` is the number of bins before `chrom` in the file's global bin
+/// ordering. Pixels returned by `File::fetch` carry global bin ids, so a
+/// chromosome's window (`lo`/`hi` local) must be shifted by `bin_offset`
+/// before matching, then shifted back to place the pixel in the window.
+#[allow(clippy::too_many_arguments)]
 fn fetch_window_matrix(
     f: &File,
     chrom: &str,
@@ -162,16 +168,23 @@ fn fetch_window_matrix(
     lo: i64,
     hi: i64,
     chrom_len: u64,
+    bin_offset: usize,
     norm: Option<&str>,
 ) -> Result<Array2<f64>> {
     let region = Region::range(chrom, lo as u64 * res, (hi as u64 * res).min(chrom_len));
     let pixels = f.fetch(&region, norm)?;
     let n = (hi - lo) as usize;
+    let win_start = bin_offset as i64 + lo;
+    let win_end = bin_offset as i64 + hi;
     let mut m = Array2::zeros((n, n));
     for p in &pixels {
-        if p.bin1_id >= lo && p.bin1_id < hi && p.bin2_id >= lo && p.bin2_id < hi {
-            let i = (p.bin1_id - lo) as usize;
-            let j = (p.bin2_id - lo) as usize;
+        if p.bin1_id >= win_start
+            && p.bin1_id < win_end
+            && p.bin2_id >= win_start
+            && p.bin2_id < win_end
+        {
+            let i = (p.bin1_id - win_start) as usize;
+            let j = (p.bin2_id - win_start) as usize;
             m[[i, j]] = p.count;
             m[[j, i]] = p.count;
         }
@@ -232,6 +245,7 @@ fn call_sub_blockbuster(
     res: u64,
     n_bins: usize,
     chrom_len: u64,
+    bin_offset: usize,
     norm: Option<&str>,
     var_threshold: Option<f64>,
     sign_threshold: f64,
@@ -242,8 +256,9 @@ fn call_sub_blockbuster(
     let per_window: Result<Vec<Vec<HighScore>>> = windows
         .par_iter()
         .map(|&(lo, hi)| {
-            let observed =
-                fetch_window_matrix(f, chrom, res, lo as i64, hi as i64, chrom_len, norm)?;
+            let observed = fetch_window_matrix(
+                f, chrom, res, lo as i64, hi as i64, chrom_len, bin_offset, norm,
+            )?;
             let mut window = block_results(&observed, var_threshold, sign_threshold, gap);
             for s in &mut window {
                 // Offset by the true window start (juicer offsets by `limStart`,
@@ -279,6 +294,14 @@ pub fn call_chrom(
     let n_windows = window_ranges(n_bins, params.matrix_width).len();
     log::info!("[{chrom}] {n_bins} bins -> {n_windows} windows (res {res}, norm {norm:?})");
 
+    // Number of bins before this chromosome in the file's global bin order.
+    let bin_offset = f
+        .chroms()?
+        .iter()
+        .take_while(|c| c.name != chrom)
+        .map(|c| (c.length as u64).div_ceil(res) as usize)
+        .sum();
+
     // Low-confidence pass: relax the sign threshold until blocks appear.
     let mut sign_threshold = params.max_low_sign_threshold;
     let low = loop {
@@ -288,6 +311,7 @@ pub fn call_chrom(
             res,
             n_bins,
             c.length as u64,
+            bin_offset,
             norm,
             None,
             sign_threshold,
@@ -314,6 +338,7 @@ pub fn call_chrom(
         res,
         n_bins,
         c.length as u64,
+        bin_offset,
         norm,
         params.var_threshold,
         params.high_sign_threshold,
