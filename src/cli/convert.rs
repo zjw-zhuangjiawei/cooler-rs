@@ -14,6 +14,8 @@ use cooler_rs::{Chrom, CoolerWriter, Error};
 /// Input matrix format.
 #[derive(Clone, Copy, ValueEnum)]
 pub enum InputFormat {
+    /// A .cool or .mcool file (auto-detected)
+    Cooler,
     /// Dense N×N whitespace-separated text matrix (the original OnTAD .mat format)
     DenseTxt,
 }
@@ -23,6 +25,8 @@ pub enum InputFormat {
 pub enum OutputFormat {
     /// Single-resolution .cool file (HDF5)
     Cool,
+    /// Multi-resolution .hic (v8) file
+    Hic,
 }
 
 #[derive(Args)]
@@ -32,7 +36,7 @@ pub struct ConvertArgs {
     input: PathBuf,
 
     /// Input format
-    #[arg(long, value_enum, value_name = "FORMAT")]
+    #[arg(long, value_enum, value_name = "FORMAT", default_value = "cooler")]
     from: InputFormat,
 
     /// Output format
@@ -45,6 +49,9 @@ pub struct ConvertArgs {
 
     #[command(flatten)]
     dense_txt: DenseTxtInputOptions,
+
+    #[command(flatten)]
+    hic: HicOutputOptions,
 }
 
 /// Options specific to `--from dense-txt`.
@@ -80,10 +87,43 @@ struct DenseTxtInputOptions {
     resolution: Option<u32>,
 }
 
+/// Options specific to `--to hic`.
+#[derive(Args)]
+struct HicOutputOptions {
+    /// Genome identifier stored in the .hic header (.cool/.mcool carry none)
+    #[arg(long, default_value = "unknown", help_heading = "hic output options")]
+    genome_id: String,
+
+    /// Name of a bins column to copy into the .hic footer as normalization
+    /// vectors (e.g. "weight"); resolutions lacking the column are skipped
+    #[arg(long, value_name = "COL", help_heading = "hic output options")]
+    weight: Option<String>,
+
+    /// Store the weight column under this name in the .hic (default: the
+    /// column name); juicer looks up "KR"/"VC", cooler columns are "weight"
+    #[arg(long, value_name = "NAME", help_heading = "hic output options")]
+    weight_name: Option<String>,
+}
+
 pub fn run(args: ConvertArgs) -> cooler_rs::Result<()> {
     match (args.from, args.to) {
         (InputFormat::DenseTxt, OutputFormat::Cool) => dense_txt_to_cool(&args),
+        (InputFormat::Cooler, OutputFormat::Hic) => cooler_to_hic(&args),
+        _ => Err(cooler_rs::Error::InvalidInput(
+            "this (--from, --to) combination is not supported".into(),
+        )),
     }
+}
+
+/// Convert a `.cool`/`.mcool` file to a multi-resolution `.hic` file.
+fn cooler_to_hic(args: &ConvertArgs) -> cooler_rs::Result<()> {
+    cooler_rs::convert::cooler_to_hic(
+        &args.input,
+        &args.output,
+        &args.hic.genome_id,
+        args.hic.weight.as_deref(),
+        args.hic.weight_name.as_deref(),
+    )
 }
 
 /// Convert a dense N×N text matrix to a single-chromosome `.cool` file.
