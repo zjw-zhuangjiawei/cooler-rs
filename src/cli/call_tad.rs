@@ -184,6 +184,18 @@ struct ArrowheadOptions {
     #[arg(long, value_name = "F", help_heading = "Arrowhead options")]
     high_sign: Option<f64>,
 
+    /// Low-confidence sign threshold sweep start (max)
+    #[arg(long, value_name = "F", help_heading = "Arrowhead options")]
+    max_low_sign: Option<f64>,
+
+    /// Low-confidence sign threshold sweep end (min)
+    #[arg(long, value_name = "F", help_heading = "Arrowhead options")]
+    min_low_sign: Option<f64>,
+
+    /// Low-confidence sign threshold sweep step
+    #[arg(long, value_name = "F", help_heading = "Arrowhead options")]
+    decrement_low_sign: Option<f64>,
+
     /// Minimum domain width, in bins
     #[arg(long, value_name = "N", help_heading = "Arrowhead options")]
     min_block_size: Option<usize>,
@@ -199,9 +211,11 @@ impl ArrowheadOptions {
             matrix_width: self.window.unwrap_or(2000),
             var_threshold: Some(self.var_threshold.unwrap_or(0.2)),
             high_sign_threshold: self.high_sign.unwrap_or(0.5),
+            max_low_sign_threshold: self.max_low_sign.unwrap_or(0.4),
+            min_low_sign_threshold: self.min_low_sign.unwrap_or(0.0),
+            decrement_low_sign_threshold: self.decrement_low_sign.unwrap_or(0.1),
             min_block_size: self.min_block_size.unwrap_or(60),
             gap: self.gap.unwrap_or(7),
-            ..Default::default()
         }
     }
 }
