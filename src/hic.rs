@@ -9,11 +9,12 @@
 //! vector of [`Pixel`]s in `symmetric-upper` form (`bin1_id <= bin2_id`), with
 //! bin ids spanning the non-`All` chromosomes in header order.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use tempfile::TempDir;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use flate2::read::ZlibDecoder;
@@ -584,7 +585,12 @@ const ALL_SCALE_FACTOR: i64 = 1000;
 ///
 /// Accepts pixels per resolution (like [`CoolerWriter::write_pixels`]) and
 /// writes a valid v8 file including the genome-wide `All` pseudo-chromosome.
-/// Pixels are buffered in memory and written by [`HicWriter::finalize`].
+/// Pixels are streamed: each [`add_pixel_chunk`] classifies into (c1,c2)
+/// groups and appends to a per-resolution tempfile under `scratch`. The
+/// `All` matrix is built incrementally during the finest-resolution pass.
+/// [`finalize`] reads each per-resolution tempfile once to write matrix
+/// records. RAM footprint is bounded by one resolution's classify data at
+/// a time (plus chunk-sized pending buffer during streaming).
 pub struct HicWriter {
     file: File,
     genome_id: String,
@@ -592,12 +598,27 @@ pub struct HicWriter {
     chroms: Vec<Chrom>,
     /// Bin sizes, sorted coarse-to-fine.
     resolutions: Vec<u32>,
-    /// Buffered pixels per resolution (symmetric-upper, global bin ids).
-    buffers: BTreeMap<u32, Vec<Pixel>>,
     /// Header attributes (key/value string pairs).
     attributes: BTreeMap<String, String>,
     /// Normalization vectors to write into the footer.
     norms: Vec<NormVec>,
+    /// Scratch tempdir owned by the writer; held to keep scratch files alive,
+    /// dropped at writer drop which deletes them.
+    #[allow(dead_code)]
+    scratch: TempDir,
+    /// Per-resolution append-only scratch writer; flushed at `finish_resolution`.
+    pixel_scratch_writers: BTreeMap<u32, BufWriter<File>>,
+    /// Per-resolution scratch path, kept for finalize-time reopen.
+    pixel_scratch_paths: BTreeMap<u32, PathBuf>,
+    /// Resolutions whose `finish_resolution` (or `add_pixels` wrapper) has been called.
+    finished: BTreeSet<u32>,
+    /// Genome-wide coarsening of finest-resolution pixels into the `All` matrix.
+    all_map: BTreeMap<(i64, i64), f64>,
+    /// `All` matrix parameters, precomputed at create (depend only on chroms + finest).
+    final_factor: u64,
+    final_bin_size_scaled: i64,
+    final_all_n_bins: i64,
+    final_all_length: i32,
 }
 
 /// One normalization vector to write into the footer.
@@ -610,8 +631,6 @@ struct NormVec {
 
 /// Chromosome-relative `(bin_x, bin_y, count)` records.
 type PairPixels = Vec<(i64, i64, f64)>;
-/// Buffered pixels classified by resolution, then by `(c1, c2)` pair.
-type Classified = BTreeMap<u32, BTreeMap<(usize, usize), PairPixels>>;
 
 /// One resolution's worth of pixel data for a single chromosome pair.
 struct ResSpec {
@@ -651,14 +670,50 @@ impl HicWriter {
             return Err(Error::InvalidInput("no resolutions".to_string()));
         }
         let file = File::create(path)?;
+        let scratch = TempDir::new()?;
+
+        // `All` matrix parameters, derived from the finest resolution.
+        let n_real = chroms.len();
+        let genome_size: i64 = chroms.iter().map(|c| c.length as i64).sum();
+        let finest = *resolutions.last().unwrap() as u64;
+        let factor =
+            ((genome_size as f64 / ALL_TARGET_BINS as f64 / finest as f64).ceil() as u64).max(1);
+        let bin_size = factor * finest;
+        let mut offsets_f = vec![0i64; n_real + 1];
+        for (i, c) in chroms.iter().enumerate() {
+            offsets_f[i + 1] = offsets_f[i] + (c.length as u64).div_ceil(finest) as i64;
+        }
+        let total_bins = offsets_f[n_real];
+        let all_length = (total_bins * finest as i64 / ALL_SCALE_FACTOR) as i32;
+        let bin_size_scaled = (bin_size as i64 / ALL_SCALE_FACTOR).max(1) as i32;
+        let all_n_bins = (total_bins as u64).div_ceil(factor) as i64;
+
+        // Pre-create one scratch file per resolution.
+        let mut pixel_scratch_writers = BTreeMap::new();
+        let mut pixel_scratch_paths = BTreeMap::new();
+        for &res in &resolutions {
+            let path = scratch.path().join(format!("pixels-{res}.bin"));
+            let f = File::create(&path)?;
+            pixel_scratch_paths.insert(res, path);
+            pixel_scratch_writers.insert(res, BufWriter::new(f));
+        }
+
         Ok(HicWriter {
             file,
             genome_id: genome_id.to_string(),
             chroms: chroms.to_vec(),
             resolutions,
-            buffers: BTreeMap::new(),
             attributes: BTreeMap::new(),
             norms: Vec::new(),
+            scratch,
+            pixel_scratch_writers,
+            pixel_scratch_paths,
+            finished: BTreeSet::new(),
+            all_map: BTreeMap::new(),
+            final_factor: factor,
+            final_bin_size_scaled: bin_size_scaled as i64,
+            final_all_n_bins: all_n_bins,
+            final_all_length: all_length,
         })
     }
 
@@ -695,54 +750,128 @@ impl HicWriter {
         Ok(())
     }
 
-    /// Buffer pixels for one resolution.
+    /// Buffer pixels for one resolution. Convenience wrapper that streams
+    /// `pixels` as a single chunk and immediately seals the resolution.
+    /// For multi-chunk streaming prefer [`add_pixel_chunk`] +
+    /// [`finish_resolution`].
     pub fn add_pixels(&mut self, resolution: u32, pixels: &[Pixel]) -> Result<()> {
+        self.add_pixel_chunk(resolution, pixels)?;
+        self.finish_resolution(resolution)?;
+        Ok(())
+    }
+
+    /// Append one chunk of pixels for `resolution`. Pixels must be in
+    /// symmetric-upper form (`bin1_id <= bin2_id`, global bin ids). Chunks
+    /// within a resolution need not be in any particular order. The chunk
+    /// is classified and appended to a per-resolution tempfile; only one
+    /// chunk's worth of classify state is held in RAM at a time.
+    pub fn add_pixel_chunk(&mut self, resolution: u32, pixels: &[Pixel]) -> Result<()> {
         if !self.resolutions.contains(&resolution) {
             return Err(Error::InvalidInput(format!(
                 "resolution {resolution} was not declared at creation"
             )));
         }
-        self.buffers
-            .entry(resolution)
-            .or_default()
-            .extend_from_slice(pixels);
+        if self.finished.contains(&resolution) {
+            return Err(Error::InvalidInput(format!(
+                "resolution {resolution} was already finalized via finish_resolution"
+            )));
+        }
+        let n_real = self.chroms.len();
+        let mut offsets = vec![0i64; n_real + 1];
+        for (i, c) in self.chroms.iter().enumerate() {
+            offsets[i + 1] = offsets[i] + (c.length as u64).div_ceil(resolution as u64) as i64;
+        }
+        let total = offsets[n_real];
+
+        // Classify the chunk into per-(c1,c2) groups.
+        let mut pairs: BTreeMap<(usize, usize), PairPixels> = BTreeMap::new();
+        for p in pixels {
+            if p.bin1_id < 0 || p.bin2_id < 0 || p.bin1_id > p.bin2_id || p.bin2_id >= total {
+                return Err(Error::InvalidInput(format!(
+                    "pixel ({}, {}) out of range or not symmetric-upper",
+                    p.bin1_id, p.bin2_id
+                )));
+            }
+            let c1 = chrom_of(&offsets, p.bin1_id)?;
+            let c2 = chrom_of(&offsets, p.bin2_id)?;
+            let bx = p.bin1_id - offsets[c1];
+            let by = p.bin2_id - offsets[c2];
+            pairs.entry((c1, c2)).or_default().push((bx, by, p.count));
+        }
+
+        // For the finest resolution, also accumulate the `All` matrix.
+        let finest = *self.resolutions.last().unwrap();
+        if resolution == finest {
+            let factor = self.final_factor;
+            for (&(c1, c2), recs) in &pairs {
+                let o1 = offsets[c1];
+                let o2 = offsets[c2];
+                for &(bx, by, count) in recs {
+                    let g1 = (o1 + bx) / factor as i64;
+                    let g2 = (o2 + by) / factor as i64;
+                    *self.all_map.entry((g1, g2)).or_insert(0.0) += count;
+                }
+            }
+        }
+
+        // Append to the per-resolution scratch file. (c1,c2) groups are
+        // written in lex order so finalize can read each scratch once.
+        let writer = self
+            .pixel_scratch_writers
+            .get_mut(&resolution)
+            .ok_or_else(|| Error::Format(format!("missing scratch for {resolution}")))?;
+        for ((c1, c2), recs) in &pairs {
+            writer.write_u32::<LittleEndian>(*c1 as u32)?;
+            writer.write_u32::<LittleEndian>(*c2 as u32)?;
+            writer.write_u32::<LittleEndian>(recs.len() as u32)?;
+            for &(bx, by, count) in recs {
+                writer.write_i64::<LittleEndian>(bx)?;
+                writer.write_i64::<LittleEndian>(by)?;
+                writer.write_f64::<LittleEndian>(count)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark `resolution` fully read. After this call no more
+    /// `add_pixel_chunk(_, resolution, _)` invocations are accepted. Flushes
+    /// the per-resolution scratch writer; finalize reads the scratch once.
+    pub fn finish_resolution(&mut self, resolution: u32) -> Result<()> {
+        if !self.resolutions.contains(&resolution) {
+            return Err(Error::InvalidInput(format!(
+                "resolution {resolution} was not declared at creation"
+            )));
+        }
+        if self.finished.contains(&resolution) {
+            return Err(Error::InvalidInput(format!(
+                "resolution {resolution} was already finalized via finish_resolution"
+            )));
+        }
+        if let Some(mut w) = self.pixel_scratch_writers.remove(&resolution) {
+            w.flush()?;
+        }
+        self.finished.insert(resolution);
         Ok(())
     }
 
     /// Write the file, consuming the writer.
     pub fn finalize(mut self) -> Result<()> {
         let n_real = self.chroms.len();
-        let genome_size: i64 = self.chroms.iter().map(|c| c.length as i64).sum();
-        let mut classified = self.classify_all()?;
-
-        // `All` matrix parameters, derived from the finest resolution.
-        let finest = *self.resolutions.last().unwrap() as u64;
-        let factor =
-            ((genome_size as f64 / ALL_TARGET_BINS as f64 / finest as f64).ceil() as u64).max(1);
-        let bin_size = factor * finest;
-        let mut offsets_f = vec![0i64; n_real + 1];
-        for (i, c) in self.chroms.iter().enumerate() {
-            offsets_f[i + 1] = offsets_f[i] + (c.length as u64).div_ceil(finest) as i64;
-        }
-        let total_bins = offsets_f[n_real];
-        let all_length = total_bins * finest as i64 / ALL_SCALE_FACTOR;
-        let bin_size_scaled = (bin_size as i64 / ALL_SCALE_FACTOR).max(1);
-
-        // Coarsen the finest-resolution pixels into the genome-wide matrix.
-        let mut all_map: BTreeMap<(i64, i64), f64> = BTreeMap::new();
-        if let Some(pairs) = classified.get(&(finest as u32)) {
-            for (&(c1, c2), px) in pairs {
-                let (o1, o2) = (offsets_f[c1], offsets_f[c2]);
-                for &(bx, by, count) in px {
-                    let g1 = (o1 + bx) / factor as i64;
-                    let g2 = (o2 + by) / factor as i64;
-                    *all_map.entry((g1, g2)).or_insert(0.0) += count;
-                }
+        for &res in &self.resolutions {
+            if !self.finished.contains(&res) {
+                return Err(Error::InvalidInput(format!(
+                    "resolution {res} has no pixels; call add_pixel_chunk + finish_resolution (or add_pixels) first"
+                )));
             }
         }
-        let all_pixels: Vec<(i64, i64, f64)> =
-            all_map.into_iter().map(|((a, b), c)| (a, b, c)).collect();
-        let all_n_bins = (total_bins as u64).div_ceil(factor) as i64;
+
+        let all_length = self.final_all_length;
+        let bin_size_scaled = self.final_bin_size_scaled;
+        let all_n_bins = self.final_all_n_bins;
+        let all_pixels: Vec<(i64, i64, f64)> = std::mem::take(&mut self.all_map)
+            .into_iter()
+            .map(|((a, b), c)| (a, b, c))
+            .collect();
 
         // Header. `All` is header chromosome 0; real chrom i is header chrom i+1.
         let mut header = Vec::new();
@@ -757,7 +886,7 @@ impl HicWriter {
         }
         header.write_i32::<LittleEndian>((n_real + 1) as i32)?; // nChrs (incl All)
         write_cstring(&mut header, "ALL")?;
-        header.write_i32::<LittleEndian>(all_length as i32)?;
+        header.write_i32::<LittleEndian>(all_length)?;
         for c in &self.chroms {
             write_cstring(&mut header, &c.name)?;
             header.write_i32::<LittleEndian>(c.length)?;
@@ -769,22 +898,46 @@ impl HicWriter {
         header.write_i32::<LittleEndian>(0)?; // nFragRes
         self.file.write_all(&header)?;
 
+        // Build pair_specs across all resolutions. To bound RAM we load one
+        // resolution's scratch at a time, accumulating per-(c1,c2) ResSpec
+        // vectors into a shared map. After all res are folded, the map's pairs
+        // are drained sequentially into matrix records.
+        let mut pair_specs: BTreeMap<(usize, usize), Vec<ResSpec>> = BTreeMap::new();
+        for &res in &self.resolutions {
+            let res_pairs = self.read_res_scratch(res)?;
+            for (&(c1, c2), pixels) in &res_pairs {
+                let n_bins1 = (self.chroms[c1].length as u64).div_ceil(res as u64) as i64;
+                pair_specs.entry((c1, c2)).or_default().push(ResSpec {
+                    bin_size: res as i64,
+                    n_bins1,
+                    pixels: pixels.clone(),
+                });
+            }
+            // res_pairs freed at end of iteration.
+        }
+
         // Matrices: each real pair, then All:All.
         let mut footers: Vec<(String, i64, i32)> = Vec::new();
         for c1 in 0..n_real {
             for c2 in c1..n_real {
-                let mut specs = Vec::with_capacity(self.resolutions.len());
-                for &res in &self.resolutions {
-                    let n_bins1 = (self.chroms[c1].length as u64).div_ceil(res as u64) as i64;
-                    let pixels = classified
-                        .get_mut(&res)
-                        .and_then(|m| m.remove(&(c1, c2)))
-                        .unwrap_or_default();
-                    specs.push(ResSpec {
-                        bin_size: res as i64,
-                        n_bins1,
-                        pixels,
-                    });
+                let specs = pair_specs.remove(&(c1, c2)).unwrap_or_default();
+                // Resolutions were pushed in coarse-to-fine order. The matrix
+                // record sub-records must be in that same order; append any
+                // missing resolutions as empty specs.
+                let mut specs = specs;
+                if specs.len() < self.resolutions.len() {
+                    for &res in &self.resolutions {
+                        let already = specs.iter().any(|s| s.bin_size == res as i64);
+                        if !already {
+                            let n_bins1 =
+                                (self.chroms[c1].length as u64).div_ceil(res as u64) as i64;
+                            specs.push(ResSpec {
+                                bin_size: res as i64,
+                                n_bins1,
+                                pixels: Vec::new(),
+                            });
+                        }
+                    }
                 }
                 let (pos, size) =
                     self.write_matrix_body((c1 + 1) as i32, (c2 + 1) as i32, &specs)?;
@@ -877,39 +1030,39 @@ impl HicWriter {
         Ok(())
     }
 
-    /// Classify buffered pixels per resolution into `(c1, c2)` pairs with
-    /// chromosome-relative bin coordinates.
-    fn classify_all(&self) -> Result<Classified> {
-        let n_real = self.chroms.len();
-        let mut out = BTreeMap::new();
-        for &res in &self.resolutions {
-            let mut offsets = vec![0i64; n_real + 1];
-            for (i, c) in self.chroms.iter().enumerate() {
-                offsets[i + 1] = offsets[i] + (c.length as u64).div_ceil(res as u64) as i64;
+    /// Read one resolution's per-pair classified pixels back from its scratch
+    /// tempfile. Returns a `BTreeMap<(c1,c2), Vec<(bx,by,count)>>` for this
+    /// resolution only. RAM held: one resolution's nnz pixels at a time.
+    fn read_res_scratch(&self, resolution: u32) -> Result<BTreeMap<(usize, usize), PairPixels>> {
+        use std::io::ErrorKind;
+        let path = self
+            .pixel_scratch_paths
+            .get(&resolution)
+            .ok_or_else(|| Error::Format(format!("missing scratch path for {resolution}")))?;
+        let mut reader = std::io::BufReader::new(File::open(path)?);
+        let mut out: BTreeMap<(usize, usize), PairPixels> = BTreeMap::new();
+        loop {
+            let c1 = match reader.read_u32::<LittleEndian>() {
+                Ok(v) => v,
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            };
+            let c2 = reader.read_u32::<LittleEndian>()?;
+            let n = reader.read_u32::<LittleEndian>()?;
+            let mut recs = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                let bx = reader.read_i64::<LittleEndian>()?;
+                let by = reader.read_i64::<LittleEndian>()?;
+                let count = reader.read_f64::<LittleEndian>()?;
+                recs.push((bx, by, count));
             }
-            let total = offsets[n_real];
-            let mut pairs: BTreeMap<(usize, usize), PairPixels> = BTreeMap::new();
-            if let Some(px) = self.buffers.get(&res) {
-                for p in px {
-                    if p.bin1_id < 0 || p.bin2_id < 0 || p.bin1_id > p.bin2_id || p.bin2_id >= total
-                    {
-                        return Err(Error::InvalidInput(format!(
-                            "pixel ({}, {}) out of range or not symmetric-upper",
-                            p.bin1_id, p.bin2_id
-                        )));
-                    }
-                    let c1 = chrom_of(&offsets, p.bin1_id)?;
-                    let c2 = chrom_of(&offsets, p.bin2_id)?;
-                    let bx = p.bin1_id - offsets[c1];
-                    let by = p.bin2_id - offsets[c2];
-                    pairs.entry((c1, c2)).or_default().push((bx, by, p.count));
-                }
-            }
-            out.insert(res, pairs);
+            out.insert((c1 as usize, c2 as usize), recs);
         }
         Ok(out)
     }
 
+    /// (Removed: classify_all — replaced by per-chunk classify inside
+    /// `add_pixel_chunk` and per-resolution scratch reread at finalize.)
     /// Write one chromosome pair's matrix record (all resolutions) and its
     /// compressed blocks, returning the record's `(position, size)` for the footer.
     fn write_matrix_body(&mut self, chr1: i32, chr2: i32, specs: &[ResSpec]) -> Result<(i64, i32)> {

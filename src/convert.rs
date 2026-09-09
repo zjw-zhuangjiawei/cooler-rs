@@ -84,9 +84,13 @@ pub fn dense_txt_to_pixels(text: &str) -> Result<(usize, Vec<Pixel>)> {
 /// the bins are not a uniform `div_ceil(chrom.length, resolution)` tiling
 /// (the only binning `.hic` can represent), or when a chromosome is named
 /// `All` (reserved for the genome-wide pseudo-chromosome).
-// ponytail: HicWriter buffers every resolution's pixels in memory until
-// finalize; stream per block if whole-genome multi-resolution inputs ever
-// need bounded memory.
+// ponytail: Bounded-RAM contract — at most one resolution's classify data
+// (≈ chunk_size × ~32 B/entry) is held in RAM at a time during streaming;
+// per-resolution classified pixels spill to scratch files under the writer's
+// tempdir. One `Cooler` HDF5 handle is open at a time. Upgrade path: if disk
+// I/O dominates at petabyte scale, swap scratch tempfiles for a streaming
+// block-level protocol (e.g. write classified blocks directly into the .hic
+// matrix body as they're produced, hold only the per-res block index).
 pub fn cooler_to_hic<P: AsRef<Path>, Q: AsRef<Path>>(
     input: P,
     output: Q,
@@ -96,9 +100,8 @@ pub fn cooler_to_hic<P: AsRef<Path>, Q: AsRef<Path>>(
 ) -> Result<()> {
     let input = input.as_ref();
 
-    // One (resolution, cooler) entry per input resolution, ascending.
-    let mut coolers: Vec<(u32, Cooler)> = Vec::new();
-    let chroms = if let Ok(mcool) = Mcool::open(input) {
+    // Phase 1: discover resolutions + chroms without holding every Cooler.
+    let (resolutions_u64, chroms) = if let Ok(mcool) = Mcool::open(input) {
         let resolutions = mcool.resolutions()?;
         if resolutions.is_empty() {
             return Err(Error::InvalidInput(
@@ -106,10 +109,7 @@ pub fn cooler_to_hic<P: AsRef<Path>, Q: AsRef<Path>>(
             ));
         }
         let chroms = mcool.cooler(resolutions[0])?.chroms()?;
-        for &res in &resolutions {
-            coolers.push((resolution_u32(res)?, mcool.cooler(res)?));
-        }
-        chroms
+        (resolutions, chroms)
     } else {
         let cool = Cooler::open_any(input).map_err(|e| {
             Error::InvalidInput(format!(
@@ -125,9 +125,7 @@ pub fn cooler_to_hic<P: AsRef<Path>, Q: AsRef<Path>>(
                 ))
             }
         };
-        let chroms = cool.chroms()?;
-        coolers.push((res, cool));
-        chroms
+        (vec![res as u64], cool.chroms()?)
     };
 
     // The `All` pseudo-chromosome is reserved by the writer (and filtered by
@@ -140,47 +138,75 @@ pub fn cooler_to_hic<P: AsRef<Path>, Q: AsRef<Path>>(
         }
     }
 
-    // Validate everything before creating the output file.
-    let mut seen_col: bool = false;
-    for (res, cool) in &coolers {
+    // Phase 2: validate per-res by reopening one Cooler at a time.
+    let mut res_u32 = Vec::with_capacity(resolutions_u64.len());
+    let mut weight_seen = false;
+    for &r in &resolutions_u64 {
+        let cool = open_res(input, r)?;
         if cool.chroms()? != chroms {
             return Err(Error::InvalidInput(
                 "chromosome sets differ across resolutions".into(),
             ));
         }
-        check_uniform_bins(cool, &chroms, *res)?;
+        let res32 = resolution_u32(r)?;
+        check_uniform_bins(&cool, &chroms, res32)?;
         if let Some(col) = weight_col {
-            seen_col |= cool.bins_has_column(col)?;
+            weight_seen |= cool.bins_has_column(col)?;
         }
+        res_u32.push(res32);
+        drop(cool);
     }
     if let Some(col) = weight_col {
-        if !seen_col {
+        if !weight_seen {
             return Err(Error::InvalidInput(format!(
                 "bins column '{col}' not found in the input"
             )));
         }
     }
 
-    let resolutions: Vec<u32> = coolers.iter().map(|(res, _)| *res).collect();
-    let mut writer = HicWriter::create(output, genome_id, &chroms, &resolutions)?;
-    for (res, cool) in &coolers {
-        let pixels = cool.pixels()?;
-        writer.add_pixels(*res, &pixels)?;
+    // Phase 3: drive the writer, one resolution at a time.
+    let mut writer = HicWriter::create(output, genome_id, &chroms, &res_u32)?;
+    // ponytail: 1M-row chunk ≈ 24 MB raw; halve if peak classify-map RAM matters more than throughput.
+    let chunk_size: i64 = 1_000_000;
+    for &res in &res_u32 {
+        let cool = open_res(input, res as u64)?;
+        let mut n_pix: u64 = 0;
+        for chunk in cool.pixels_chunked(chunk_size)? {
+            let chunk = chunk?;
+            n_pix += chunk.len() as u64;
+            writer.add_pixel_chunk(res, &chunk)?;
+        }
+        writer.finish_resolution(res)?;
         if let Some(col) = weight_col {
             let name = weight_name.unwrap_or(col);
             if cool.bins_has_column(col)? {
-                let vectors = split_bins_column(cool, &chroms, col)?;
-                writer.add_normalization_vectors(*res, name, &vectors)?;
+                let vectors = split_bins_column(&cool, &chroms, col)?;
+                writer.add_normalization_vectors(res, name, &vectors)?;
             } else {
                 log::info!(
                     "resolution {res} has no bins/{col} column; writing no normalization vectors"
                 );
             }
         }
-        log::info!("wrote resolution {res} ({} pixels)", pixels.len());
+        log::info!("wrote resolution {res} ({n_pix} pixels)");
+        drop(cool);
     }
     writer.finalize()?;
     Ok(())
+}
+
+/// Open the input as a `Cooler` for the given resolution: `.mcool` group if
+/// the input is multi-resolution, otherwise the single-resolution `.cool`.
+fn open_res(input: &Path, res: u64) -> Result<Cooler> {
+    if let Ok(mcool) = Mcool::open(input) {
+        return mcool.cooler(res);
+    }
+    Cooler::open_any(input).map_err(|e| {
+        Error::InvalidInput(format!(
+            "cannot read '{}' as a .cool/.mcool file: {e}",
+            input.display()
+        ))
+    })
 }
 
 /// Reject resolutions that cannot be represented in the `.hic` header.

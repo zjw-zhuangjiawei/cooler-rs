@@ -194,3 +194,52 @@ fn mcool_partial_weight_column_is_skipped_when_absent() {
     // …and absent (None, not an error) where the column does not exist.
     assert_eq!(hic.norm_vector(50_000, "chr1", "weight").unwrap(), None);
 }
+
+/// Resolve the optional large-fixture .mcool used for the bounded-RAM test.
+/// Skips (no-op) when the fixture is absent, matching the discipline in
+/// `tests/hic.rs` (`fixture()`).
+fn fixture_mcool() -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/4DNFIZ1ZVXC8.mcool");
+    p.exists().then_some(p)
+}
+
+#[cfg(unix)]
+fn resident_bytes() -> u64 {
+    // /proc/self/statm: size | resident | shared | text | data | dirty
+    let s = std::fs::read_to_string("/proc/self/statm").unwrap();
+    let mut it = s.split_whitespace();
+    let _size: u64 = it.next().unwrap().parse().unwrap();
+    let resident_pages: u64 = it.next().unwrap().parse().unwrap();
+    resident_pages * 4096
+}
+
+#[cfg(not(unix))]
+fn resident_bytes() -> u64 {
+    0
+}
+
+#[test]
+fn convert_large_mcool_stays_bounded() {
+    let Some(input) = fixture_mcool() else {
+        eprintln!("skipping: 4DNFIZ1ZVXC8.mcool not present");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.hic");
+
+    let peak_before = resident_bytes();
+    cooler_to_hic(&input, &out, "test", None, None).unwrap();
+    let peak_after = resident_bytes();
+    let delta_mb = peak_after.saturating_sub(peak_before) / 1_000_000;
+
+    assert!(
+        delta_mb < 512,
+        "peak RSS grew by {delta_mb} MB during conversion; budget is 512 MB"
+    );
+
+    let hic = HiCFile::open(&out).unwrap();
+    assert!(!hic.resolutions().is_empty());
+    let coarse = *hic.resolutions().iter().min().unwrap();
+    let pixels = hic.pixels(coarse).unwrap();
+    assert!(!pixels.is_empty(), "no pixels at coarsest resolution");
+}

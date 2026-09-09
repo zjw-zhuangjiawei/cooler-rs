@@ -749,6 +749,21 @@ impl Cooler {
             .collect())
     }
 
+    /// Iterate the `/pixels` table in `chunk_size` slices. Rows come back in
+    /// stored order. The last slice may be shorter than `chunk_size`. Caller
+    /// picks `chunk_size` to bound downstream buffer size — the reader side
+    /// issues one HDF5 read per slice, independent of HDF5's internal
+    /// chunking.
+    pub fn pixels_chunked(&self, chunk_size: i64) -> Result<PixelsChunked<'_>> {
+        let nnz = self.n_pixels()? as i64;
+        Ok(PixelsChunked {
+            clr: self,
+            chunk_size: chunk_size.max(1),
+            lo: 0,
+            hi: nnz,
+        })
+    }
+
     /// Read the `bins/chrom` column (chromosome id per bin).
     pub fn bin_chrom(&self) -> Result<Vec<i32>> {
         Ok(self.group.dataset("bins/chrom")?.read_1d()?.to_vec())
@@ -1335,5 +1350,78 @@ impl Cooler {
             tri.add_triplet((i - q.rows.start) as usize, (j - q.cols.start) as usize, v);
         }
         Ok(tri)
+    }
+}
+
+/// Iterator returned by [`Cooler::pixels_chunked`]. Yields successive
+/// `Result<Vec<Pixel>>` chunks of the `/pixels` table in stored order.
+pub struct PixelsChunked<'a> {
+    clr: &'a Cooler,
+    chunk_size: i64,
+    lo: i64,
+    hi: i64,
+}
+
+impl<'a> Iterator for PixelsChunked<'a> {
+    type Item = Result<Vec<Pixel>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.lo >= self.hi {
+            return None;
+        }
+        let hi = (self.lo + self.chunk_size).min(self.hi);
+        let res = self.clr.pixels_range(self.lo, hi);
+        self.lo = hi;
+        Some(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synth_cool(dir: &std::path::Path, pixels: &[Pixel]) -> Cooler {
+        use crate::types::Chrom;
+        let chroms = vec![Chrom {
+            name: "chr1".into(),
+            length: 300,
+        }];
+        let bin_size = 100;
+        let path = dir.join("synth.cool");
+        let _ = std::fs::remove_file(&path);
+        let w = CoolerWriter::create(&path, &chroms, bin_size).unwrap();
+        w.write_pixels(pixels).unwrap();
+        drop(w);
+        Cooler::open(&path).unwrap()
+    }
+
+    #[test]
+    fn pixels_chunked_joins_to_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let pixels: Vec<Pixel> = (0..9)
+            .map(|i| {
+                let (mut a, mut b) = (i / 3, i % 3);
+                if a > b {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                Pixel {
+                    bin1_id: a,
+                    bin2_id: b,
+                    count: i as f64,
+                }
+            })
+            .collect();
+        let clr = synth_cool(dir.path(), &pixels);
+
+        let full = clr.pixels().unwrap();
+
+        for chunk_size in [1, 2, 7, 100] {
+            let joined: Vec<Pixel> = clr
+                .pixels_chunked(chunk_size)
+                .unwrap()
+                .flat_map(|c| c.unwrap())
+                .collect();
+            assert_eq!(joined.len(), full.len(), "chunk_size {chunk_size}");
+            assert_eq!(joined, full, "chunk_size {chunk_size}");
+        }
     }
 }
