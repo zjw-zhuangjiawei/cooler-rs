@@ -28,7 +28,7 @@ use cooler_rs::file::File;
 use cooler_rs::hic::HiCFile;
 use cooler_rs::mcool::Mcool;
 use cooler_rs::region::Region;
-use cooler_rs::types::Chrom;
+use cooler_rs::types::{Bin, Chrom, Pixel};
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Table {
@@ -284,13 +284,84 @@ fn dump_chroms(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
     )))
 }
 
+/// The chromosomes of `input`, seen at `resolution`.
+fn input_chroms(input: &Input, resolution: u32) -> Result<Vec<Chrom>> {
+    Ok(match input {
+        Input::Hic(h) => h.chromosomes(),
+        Input::Cool(c) => c.chroms()?,
+        Input::Mcool(m) => m.cooler(resolution as u64)?.chroms()?,
+    })
+}
+
+/// The uniform `div_ceil(length, resolution)` bins of `chroms`, plus their
+/// per-chromosome offsets.
+///
+/// Derived here rather than read through `File`, whose `.hic` variant
+/// materializes *and sorts* every pixel of the resolution on first access
+/// (`file.rs`, `build_hic`). At 250 bp that is ~10 GB before a single row is
+/// printed, so `dump` used to OOM on any fine-resolution input.
+fn tiled_bins(chroms: &[Chrom], resolution: u32) -> (Vec<Bin>, Vec<i64>) {
+    let mut bins = Vec::new();
+    let mut chrom_offset = vec![0i64];
+    for (k, c) in chroms.iter().enumerate() {
+        let n = (c.length as u64).div_ceil(resolution as u64);
+        for i in 0..n {
+            bins.push(Bin {
+                chrom_id: k as i32,
+                start: (i * resolution as u64) as i32,
+                end: (((i + 1) * resolution as u64).min(c.length as u64)) as i32,
+            });
+        }
+        chrom_offset.push(bins.len() as i64);
+    }
+    (bins, chrom_offset)
+}
+
+/// Append `resolution`'s pixels that fall inside the cis block `[i0, i1)`.
+/// Streams: only the retained region is held.
+fn collect_cis(
+    input: &Input,
+    resolution: u32,
+    i0: i64,
+    i1: i64,
+    sink: &mut Vec<Pixel>,
+) -> Result<()> {
+    let keep = |p: &Pixel| p.bin1_id >= i0 && p.bin1_id < i1 && p.bin2_id >= i0 && p.bin2_id < i1;
+    let mut push = |p: Pixel| {
+        if keep(&p) {
+            sink.push(p);
+        }
+    };
+    match input {
+        Input::Hic(h) => h.for_each_pixel(resolution, |p| {
+            push(p);
+            Ok(())
+        })?,
+        // ponytail: 1M-pixel read chunks; bounds the read buffer only, the
+        // retained set is still whatever `--range` selects.
+        Input::Cool(c) => {
+            for chunk in c.pixels_chunked(1 << 20)? {
+                for p in chunk? {
+                    push(p);
+                }
+            }
+        }
+        Input::Mcool(m) => {
+            for chunk in m.cooler(resolution as u64)?.pixels_chunked(1 << 20)? {
+                for p in chunk? {
+                    push(p);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn dump_bins(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
     let input = open_input(args)?;
     let res = resolve_resolution(args, &input)?;
-    let file = File::open(&args.uri, res)?;
-    let chroms = file.chroms()?;
-    let bins = file.bins()?;
-    let chrom_offset = file.chrom_offset()?;
+    let chroms = input_chroms(&input, res)?;
+    let (bins, chrom_offset) = tiled_bins(&chroms, res);
 
     let (i0, i1) = match parse_range(&args.range)? {
         None => (0, bins.len() as i64),
@@ -322,10 +393,8 @@ fn hic_global_weights(hic: &HiCFile, res: u32, name: &str) -> Result<Vec<f64>> {
 fn dump_weights(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
     let input = open_input(args)?;
     let res = resolve_resolution(args, &input)?;
-    let file = File::open(&args.uri, res)?;
-    let chroms = file.chroms()?;
-    let bins = file.bins()?;
-    let chrom_offset = file.chrom_offset()?;
+    let chroms = input_chroms(&input, res)?;
+    let (bins, chrom_offset) = tiled_bins(&chroms, res);
 
     let (i0, i1) = match parse_range(&args.range)? {
         None => (0, bins.len() as i64),
@@ -343,7 +412,10 @@ fn dump_weights(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
             (names, columns)
         }
         // cooler `bins` columns are multiplicative, so hictk prints `1 / w`.
+        // Only the `bins` table is read here — unlike the `.hic` variant,
+        // `File` on a cooler never touches the pixels.
         _ => {
+            let file = File::open(&args.uri, res)?;
             let mut names = file.avail_normalizations()?;
             names.sort();
             names.dedup();
@@ -396,10 +468,8 @@ fn file_weights(file: &File, name: &str, n_bins: usize) -> Result<Vec<f64>> {
 fn dump_pixels(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
     let input = open_input(args)?;
     let res = resolve_resolution(args, &input)?;
-    let file = File::open(&args.uri, res)?;
-    let chroms = file.chroms()?;
-    let bins = file.bins()?;
-    let chrom_offset = file.chrom_offset()?;
+    let chroms = input_chroms(&input, res)?;
+    let (bins, chrom_offset) = tiled_bins(&chroms, res);
 
     // A region is a cis block: both ends must fall inside it. `File::fetch`
     // is a *row* query (bin2 spans the whole chromosome), so filter here.
@@ -416,12 +486,22 @@ fn dump_pixels(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
         None => None,
         Some(name) => Some(match &input {
             Input::Hic(h) => hic_global_weights(h, res, name)?,
-            _ => file_weights(&file, name, bins.len())?,
+            _ => file_weights(&File::open(&args.uri, res)?, name, bins.len())?,
         }),
     };
 
-    let mut pixels = file.pixels()?;
-    pixels.retain(|p| p.bin1_id >= i0 && p.bin1_id < i1 && p.bin2_id >= i0 && p.bin2_id < i1);
+    // Read streamed (`File::pixels` used to materialize and sort the whole
+    // resolution). The sort is still needed — `.hic` stores blocks in
+    // (bin2-block, bin1-block) order, not the ascending order
+    // `DumpConfig::sorted{true}` makes hictk's default — so this buffers the
+    // *selected* pixels.
+    // ponytail: a whole-file dump of a 250 bp matrix therefore still holds
+    // ~10 GB (429M pixels). `--range` bounds it, and a region is the sane way
+    // to inspect a fine resolution. Upgrade path: k-way merge over block
+    // columns, as hictk's sorted pixel selector does, to stream in order.
+    let mut pixels = Vec::new();
+    collect_cis(&input, res, i0, i1, &mut pixels)?;
+    pixels.sort_unstable_by_key(|p| (p.bin1_id, p.bin2_id));
     if let Some(w) = &weights {
         for p in &mut pixels {
             let (a, b) = (p.bin1_id as usize, p.bin2_id as usize);

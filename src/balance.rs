@@ -635,7 +635,7 @@ pub fn vc_weights(f: &File, cis_only: bool) -> Result<Weights> {
     let n = bins.len();
     let bin_chrom: Vec<i32> = bins.iter().map(|b| b.chrom_id).collect();
     let mut marg = vec![0.0f64; n];
-    for p in f.pixels()? {
+    for p in f.pixels()?.iter() {
         let b1 = p.bin1_id as usize;
         let b2 = p.bin2_id as usize;
         if cis_only && bin_chrom[b1] != bin_chrom[b2] {
@@ -657,7 +657,7 @@ pub fn vc_sqrt_weights(f: &File, cis_only: bool) -> Result<Weights> {
     let n = bins.len();
     let bin_chrom: Vec<i32> = bins.iter().map(|b| b.chrom_id).collect();
     let mut marg = vec![0.0f64; n];
-    for p in f.pixels()? {
+    for p in f.pixels()?.iter() {
         let b1 = p.bin1_id as usize;
         let b2 = p.bin2_id as usize;
         if cis_only && bin_chrom[b1] != bin_chrom[b2] {

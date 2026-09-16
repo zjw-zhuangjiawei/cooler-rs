@@ -3,6 +3,7 @@
 //! normalization-aware `fetch`, so callers (and balancing) work on either
 //! format without branching.
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use crate::cooler::Cooler;
@@ -26,11 +27,13 @@ pub struct HicState {
     cache: OnceLock<std::result::Result<HicData, String>>,
 }
 
-/// Materialized data for one `.hic` resolution: bins, offsets, and all pixels
-/// sorted by `(bin1_id, bin2_id)` so `bin1_offset` slicing is valid.
+/// Materialized data for one `.hic` resolution: every pixel sorted by
+/// `(bin1_id, bin2_id)`, plus the row offsets that slicing depends on.
+///
+/// Deliberately holds no bins or chromosome offsets — those come from
+/// [`HicState::tiling`] and cost nothing, so a bin-table query never drags the
+/// matrix in with it.
 struct HicData {
-    bins: Vec<Bin>,
-    chrom_offset: Vec<i64>,
     pixels: Vec<Pixel>,
     bin1_offset: Vec<i64>,
 }
@@ -39,31 +42,39 @@ impl HicState {
     fn data(&self) -> Result<&HicData> {
         let r = self
             .cache
-            .get_or_init(|| build_hic(&self.file, self.resolution).map_err(|e| e.to_string()));
+            .get_or_init(|| build_hic(self).map_err(|e| e.to_string()));
         r.as_ref().map_err(|s| Error::Format(s.clone()))
+    }
+
+    /// Uniform bins and per-chromosome offsets at this resolution.
+    ///
+    /// Derived from the header's chromosome lengths, so it never forces
+    /// `data()` — the whole point, since `data()` materializes and sorts every
+    /// pixel of the resolution. Callers that want a bin table, a bin count or
+    /// a chromosome offset must not pay for the matrix.
+    fn tiling(&self) -> (Vec<Bin>, Vec<i64>) {
+        let mut bins = Vec::new();
+        let mut chrom_offset = vec![0i64];
+        for (k, c) in self.file.chromosomes().iter().enumerate() {
+            let n = (c.length as u64).div_ceil(self.resolution as u64);
+            for i in 0..n {
+                bins.push(Bin {
+                    chrom_id: k as i32,
+                    start: (i * self.resolution as u64) as i32,
+                    end: (((i + 1) * self.resolution as u64).min(c.length as u64)) as i32,
+                });
+            }
+            chrom_offset.push(bins.len() as i64);
+        }
+        (bins, chrom_offset)
     }
 }
 
-fn build_hic(file: &HiCFile, resolution: u32) -> Result<HicData> {
-    let chroms = file.chromosomes();
-    let mut bins = Vec::new();
-    let mut chrom_offset = vec![0i64];
-    for (k, c) in chroms.iter().enumerate() {
-        let n = (c.length as u64).div_ceil(resolution as u64);
-        for i in 0..n {
-            let start = i * resolution as u64;
-            let end = ((i + 1) * resolution as u64).min(c.length as u64);
-            bins.push(Bin {
-                chrom_id: k as i32,
-                start: start as i32,
-                end: end as i32,
-            });
-        }
-        chrom_offset.push(bins.len() as i64);
-    }
+fn build_hic(state: &HicState) -> Result<HicData> {
+    let (bins, _) = state.tiling();
 
-    let mut pixels = file.pixels(resolution)?;
-    pixels.sort_by_key(|p| (p.bin1_id, p.bin2_id));
+    let mut pixels = state.file.pixels(state.resolution)?;
+    pixels.sort_unstable_by_key(|p| (p.bin1_id, p.bin2_id));
 
     let n_bins = bins.len();
     let mut bin1_offset = vec![0i64; n_bins + 1];
@@ -75,8 +86,6 @@ fn build_hic(file: &HiCFile, resolution: u32) -> Result<HicData> {
     }
 
     Ok(HicData {
-        bins,
-        chrom_offset,
         pixels,
         bin1_offset,
     })
@@ -127,7 +136,7 @@ impl File {
     pub fn bins(&self) -> Result<Vec<Bin>> {
         match self {
             File::Cooler(c) => c.bins(),
-            File::Hic(h) => Ok(h.data()?.bins.clone()),
+            File::Hic(h) => Ok(h.tiling().0),
         }
     }
 
@@ -141,21 +150,26 @@ impl File {
     pub fn n_bins(&self) -> Result<usize> {
         match self {
             File::Cooler(c) => Ok(c.bins()?.len()),
-            File::Hic(h) => Ok(h.data()?.bins.len()),
+            File::Hic(h) => Ok(h.tiling().0.len()),
         }
     }
 
-    pub fn pixels(&self) -> Result<Vec<Pixel>> {
+    /// Every pixel at this resolution, sorted by `(bin1_id, bin2_id)`.
+    ///
+    /// Borrowed for `.hic` (the cached view is reused, not copied) and owned
+    /// for `.cool`, whose pixels are read out of HDF5 on demand. The earlier
+    /// `.hic` arm cloned the cache, doubling peak RAM on a fine resolution.
+    pub fn pixels(&self) -> Result<Cow<'_, [Pixel]>> {
         match self {
-            File::Cooler(c) => c.pixels(),
-            File::Hic(h) => Ok(h.data()?.pixels.clone()),
+            File::Cooler(c) => Ok(Cow::Owned(c.pixels()?)),
+            File::Hic(h) => Ok(Cow::Borrowed(&h.data()?.pixels)),
         }
     }
 
     pub fn chrom_offset(&self) -> Result<Vec<i64>> {
         match self {
             File::Cooler(c) => c.chrom_offset(),
-            File::Hic(h) => Ok(h.data()?.chrom_offset.clone()),
+            File::Hic(h) => Ok(h.tiling().1),
         }
     }
 
@@ -207,9 +221,10 @@ impl File {
                 let res = h.resolution as u64;
                 let lo = start / res;
                 let hi = if end == start { lo } else { end.div_ceil(res) };
+                let (_, chrom_offset) = h.tiling();
+                let g0 = chrom_offset[cid];
+                let g1 = chrom_offset[cid + 1];
                 let data = h.data()?;
-                let g0 = data.chrom_offset[cid];
-                let g1 = data.chrom_offset[cid + 1];
                 let lo_g = g0 + lo as i64;
                 let hi_g = g0 + hi as i64;
                 let mut pixels: Vec<Pixel> = data
@@ -274,15 +289,15 @@ impl MatrixSource for Box<HicState> {
     }
 
     fn n_bins(&self) -> Result<usize> {
-        Ok(self.data()?.bins.len())
+        Ok(self.tiling().0.len())
     }
 
     fn bin_chrom(&self) -> Result<Vec<i32>> {
-        Ok(self.data()?.bins.iter().map(|b| b.chrom_id).collect())
+        Ok(self.tiling().0.iter().map(|b| b.chrom_id).collect())
     }
 
     fn chrom_offset(&self) -> Result<Vec<i64>> {
-        Ok(self.data()?.chrom_offset.clone())
+        Ok(self.tiling().1)
     }
 
     fn bin1_offset(&self) -> Result<Vec<i64>> {
