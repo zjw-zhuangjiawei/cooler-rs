@@ -5,6 +5,7 @@
 //!   `compare`   compare multiple matrices and plot a correlation heatmap
 //!   `convert`   convert other matrix formats to/from cooler format
 //!   `normalize` normalize a contact matrix (ic or raichu)
+//!   `validate`  check a .cool/.mcool file for internal consistency
 //!   `zoomify`   coarsen a single-resolution .cool into a multi-resolution .mcool
 
 mod cli;
@@ -32,6 +33,8 @@ enum Commands {
     Convert(cli::convert::ConvertArgs),
     /// Normalize a contact matrix (iterative correction or Raichu)
     Normalize(cli::normalize::NormalizeArgs),
+    /// Check a .cool/.mcool file for internal consistency
+    Validate(cli::validate::ValidateArgs),
     /// Coarsen a single-resolution .cool into a multi-resolution .mcool
     Zoomify(cli::zoomify::ZoomifyArgs),
 }
@@ -47,6 +50,7 @@ fn main() {
         Commands::Compare(args) => cli::compare::run(args),
         Commands::Convert(args) => cli::convert::run(args),
         Commands::Normalize(args) => cli::normalize::run(args),
+        Commands::Validate(args) => cli::validate::run(args),
         Commands::Zoomify(args) => cli::zoomify::run(args),
     };
     if let Err(e) = result {

@@ -33,6 +33,10 @@ plus the `cooler-rs` command-line tool for Hi-C analysis.
     stratum-adjusted correlation coefficient, a port of
     [hicrep](https://github.com/cmdoret/hicrep)), `--metric pearson`, and
     `--metric spearman`.
+  - `cooler-rs validate` — check a `.cool`/`.mcool` file for internal
+    consistency (schema + index invariants: offsets, bin/chrom codes, pixel
+    ordering and ranges). Checks every resolution of a `.mcool`; prints each
+    issue and exits non-zero if any was found.
 
 ## Usage
 
