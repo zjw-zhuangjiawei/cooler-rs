@@ -2,6 +2,10 @@
 //!
 //! An `.mcool` file stores one full cooler collection per resolution under
 //! `/resolutions/<binsize>`, with root attribute `format = "HDF5::MCOOL"`.
+//!
+//! Schema v1 (cooler < 0.8, or `cooler zoomify --legacy`) instead stores one
+//! collection per *zoom level* as a root-level group named `"0"`, `"1"`, ...,
+//! and carries no root `format` attribute. Both layouts are read here.
 
 use std::path::Path;
 
@@ -68,34 +72,78 @@ impl McoolWriter {
     }
 }
 
+/// Legacy (schema v1) layout: one cooler per zoom level as a root-level group
+/// named `"0"`, `"1"`, ... The group name is a zoom *level*, not a bin size —
+/// the resolution is each group's own `bin-size` attribute. Ordered coarsest
+/// (level `0`) to base.
+///
+/// Returns `(bin_size, group name)` sorted by resolution.
+fn legacy_layout(file: &File) -> Result<Vec<(u64, String)>> {
+    let root = file.group("/")?;
+    let mut out = Vec::new();
+    for name in root.member_names()? {
+        if name.parse::<u64>().is_err() {
+            continue;
+        }
+        let Ok(group) = root.group(&name) else {
+            continue;
+        };
+        if !(group.link_exists("bins") && group.link_exists("pixels")) {
+            continue;
+        }
+        let Ok(attr) = group.attr("bin-size") else {
+            continue;
+        };
+        out.push((attr.read_scalar::<i64>()? as u64, name));
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
 /// Reader for `.mcool` files.
 pub struct Mcool {
     file: File,
+    /// Schema v1 layout (see [`legacy_layout`]) instead of
+    /// `/resolutions/<binsize>`.
+    legacy: bool,
 }
 
 impl Mcool {
     /// Open an existing `.mcool` file, validating the `format` attribute.
+    ///
+    /// Schema v1 files carry no `format` attribute; they are recognised by
+    /// their root-level zoom-level groups.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path)?;
         let root = file.group("/")?;
-        match root.attr("format") {
-            Ok(attr) => {
-                let format = attr
-                    .read_scalar::<hdf5_metno::types::VarLenUnicode>()?
-                    .to_string();
-                if format != MCOOL_FORMAT {
-                    return Err(Error::Format(format!(
-                        "expected format '{MCOOL_FORMAT}', found '{format}'"
-                    )));
-                }
+        if let Ok(attr) = root.attr("format") {
+            let format = attr
+                .read_scalar::<hdf5_metno::types::VarLenUnicode>()?
+                .to_string();
+            if format != MCOOL_FORMAT {
+                return Err(Error::Format(format!(
+                    "expected format '{MCOOL_FORMAT}', found '{format}'"
+                )));
             }
-            Err(_) => return Err(Error::Format("missing 'format' attribute".into())),
+        } else if !legacy_layout(&file)?.is_empty() {
+            return Ok(Mcool { file, legacy: true });
+        } else {
+            return Err(Error::Format("missing 'format' attribute".into()));
         }
-        Ok(Mcool { file })
+        Ok(Mcool {
+            file,
+            legacy: false,
+        })
     }
 
     /// List the available resolutions (bin sizes), sorted ascending.
     pub fn resolutions(&self) -> Result<Vec<u64>> {
+        if self.legacy {
+            return Ok(legacy_layout(&self.file)?
+                .into_iter()
+                .map(|(bin_size, _)| bin_size)
+                .collect());
+        }
         let group = self.file.group(RESOLUTIONS_GROUP)?;
         let mut resolutions = Vec::new();
         for name in group.member_names()? {
@@ -110,7 +158,16 @@ impl Mcool {
 
     /// Open the cooler collection for a given resolution.
     pub fn cooler(&self, bin_size: u64) -> Result<Cooler> {
-        let path = format!("{RESOLUTIONS_GROUP}/{bin_size}");
+        let path = if self.legacy {
+            let name = legacy_layout(&self.file)?
+                .into_iter()
+                .find(|(bs, _)| *bs == bin_size)
+                .map(|(_, name)| name)
+                .ok_or_else(|| Error::Format(format!("resolution {bin_size} not found")))?;
+            name
+        } else {
+            format!("{RESOLUTIONS_GROUP}/{bin_size}")
+        };
         let group = self
             .file
             .group(&path)

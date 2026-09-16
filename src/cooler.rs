@@ -21,6 +21,8 @@ use crate::types::{Bin, Chrom, Pixel};
 pub const COOL_FORMAT: &str = "HDF5::Cooler";
 /// Schema version written to the `format-version` attribute.
 pub const COOL_FORMAT_VERSION: i64 = 3;
+/// Value of the `storage-mode` attribute (the only mode readers here handle).
+pub const STORAGE_MODE: &str = "symmetric-upper";
 
 /// A value to store as a dataset attribute (e.g. balancing stats).
 #[derive(Debug, Clone)]
@@ -354,7 +356,7 @@ impl CoolerWriter {
         write_attr_int(&group, "format-version", COOL_FORMAT_VERSION)?;
         write_attr_str(&group, "bin-type", "fixed")?;
         write_attr_int(&group, "bin-size", i64::from(bin_size))?;
-        write_attr_str(&group, "storage-mode", "symmetric-upper")?;
+        write_attr_str(&group, "storage-mode", STORAGE_MODE)?;
 
         // /chroms table.
         let chrom_group = group.create_group("chroms")?;
@@ -560,22 +562,29 @@ impl Cooler {
     }
 
     fn check_format(&self) -> Result<()> {
-        match self.group.attr("format") {
-            Ok(attr) => {
-                let format = attr.read_scalar::<VarLenUnicode>()?.to_string();
-                if format != COOL_FORMAT {
-                    return Err(Error::Format(format!(
-                        "expected format '{COOL_FORMAT}', found '{format}'"
-                    )));
-                }
-                Ok(())
-            }
-            Err(_) => {
-                // Older cooler files may lack the format attribute;
-                // accept them and proceed.
-                Ok(())
+        if let Ok(attr) = self.group.attr("format") {
+            let format = attr.read_scalar::<VarLenUnicode>()?.to_string();
+            if format != COOL_FORMAT {
+                return Err(Error::Format(format!(
+                    "expected format '{COOL_FORMAT}', found '{format}'"
+                )));
             }
         }
+        // Older cooler files may lack the format attribute; accept them and
+        // proceed.
+
+        // Schema v3 added `storage-mode`; v1/v2 are always symmetric-upper.
+        // A `square` file holds both triangles, so every reader below (and
+        // every caller that assumes `bin1 <= bin2`) would misread it.
+        if let Ok(attr) = self.group.attr("storage-mode") {
+            let mode = attr.read_scalar::<VarLenUnicode>()?.to_string();
+            if mode != STORAGE_MODE {
+                return Err(Error::Format(format!(
+                    "storage-mode '{mode}' is not supported (need '{STORAGE_MODE}')"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn read_strings(&self, path: &str) -> Result<Vec<String>> {
@@ -664,7 +673,7 @@ impl Cooler {
 
     /// Read the `/bins` table.
     pub fn bins(&self) -> Result<Vec<Bin>> {
-        let chrom_id: Vec<i32> = self.group.dataset("bins/chrom")?.read_1d()?.to_vec();
+        let chrom_id = self.bin_chrom()?;
         let start: Vec<i32> = self.group.dataset("bins/start")?.read_1d()?.to_vec();
         let end: Vec<i32> = self.group.dataset("bins/end")?.read_1d()?.to_vec();
         Ok(chrom_id
@@ -765,8 +774,29 @@ impl Cooler {
     }
 
     /// Read the `bins/chrom` column (chromosome id per bin).
+    ///
+    /// Schema v2 made this an integer (py-cooler writes it as an enum over
+    /// `/chroms/name`); schema v1 stored the chromosome *name* as a string.
+    /// Both forms map onto the same ids.
     pub fn bin_chrom(&self) -> Result<Vec<i32>> {
-        Ok(self.group.dataset("bins/chrom")?.read_1d()?.to_vec())
+        let ds = self.group.dataset("bins/chrom")?;
+        if let Ok(ids) = ds.read_1d::<i32>() {
+            return Ok(ids.to_vec());
+        }
+        let names = self.read_strings("bins/chrom")?;
+        let chroms = self.chroms()?;
+        names
+            .iter()
+            .map(|name| {
+                chroms
+                    .iter()
+                    .position(|c| &c.name == name)
+                    .map(|i| i as i32)
+                    .ok_or_else(|| {
+                        Error::Format(format!("bins/chrom references unknown chromosome '{name}'"))
+                    })
+            })
+            .collect()
     }
 
     /// Read pixels whose `bin1_id` falls in `[first, last)` — one
