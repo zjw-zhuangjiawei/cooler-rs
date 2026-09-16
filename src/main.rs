@@ -31,6 +31,8 @@ enum Commands {
     Compare(cli::compare::CompareArgs),
     /// Convert other matrix formats to/from cooler format
     Convert(cli::convert::ConvertArgs),
+    /// Write tables from a .hic/.cool/.mcool file to stdout
+    Dump(cli::dump::DumpArgs),
     /// Normalize a contact matrix (iterative correction or Raichu)
     Normalize(cli::normalize::NormalizeArgs),
     /// Check a .cool/.mcool file for internal consistency
@@ -49,6 +51,7 @@ fn main() {
         Commands::CallTad(args) => cli::call_tad::run(args),
         Commands::Compare(args) => cli::compare::run(args),
         Commands::Convert(args) => cli::convert::run(args),
+        Commands::Dump(args) => cli::dump::run(args),
         Commands::Normalize(args) => cli::normalize::run(args),
         Commands::Validate(args) => cli::validate::run(args),
         Commands::Zoomify(args) => cli::zoomify::run(args),

@@ -33,6 +33,9 @@ plus the `cooler-rs` command-line tool for Hi-C analysis.
     stratum-adjusted correlation coefficient, a port of
     [hicrep](https://github.com/cmdoret/hicrep)), `--metric pearson`, and
     `--metric spearman`.
+  - `cooler-rs dump` — write tables out of a `.hic`/`.cool`/`.mcool` file to
+    stdout (`chroms`, `bins`, `pixels`, `resolutions`, `normalizations`,
+    `weights`), a port of `hictk dump` that reproduces its output byte-for-byte.
   - `cooler-rs validate` — check a `.cool`/`.mcool` file for internal
     consistency (schema + index invariants: offsets, bin/chrom codes, pixel
     ordering and ranges). Checks every resolution of a `.mcool`; prints each
@@ -84,6 +87,11 @@ cargo run --release -- call-tad /tmp/toy.cool --method armatus --chr chr1 --gamm
 
 # Dense matrix -> .cool
 cargo run --release -- convert --from dense-txt matrix.txt -o out.cool -L 250000000 -r 100000
+
+# Dump a table to stdout (hictk-compatible output)
+cargo run --release -- dump ranks.hic -t resolutions
+cargo run --release -- dump ranks.hic -t pixels --resolution 10000 -r 2L:0-30000 -b KR
+cargo run --release -- dump ranks.hic -t pixels --resolution 10000 -r 2L:0-30000 --join
 
 # Coarsen a single-resolution .cool into a multi-resolution .mcool
 cargo run --release -- zoomify /tmp/toy.cool -o /tmp/toy.mcool
