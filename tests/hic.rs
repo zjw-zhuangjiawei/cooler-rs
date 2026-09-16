@@ -105,6 +105,58 @@ fn roundtrips_pixels() {
     std::fs::remove_file(&tmp).ok();
 }
 
+/// Pixels are spilled once per `add_pixel_chunk` call, so one chromosome pair
+/// can appear as several scratch records. Reading the scratch back used to
+/// `insert` per pair, overwriting every earlier chunk: any pair whose pixels
+/// spanned a chunk boundary silently lost all but its last slice.
+#[test]
+fn keeps_pixels_split_across_chunks() {
+    let chroms = vec![Chrom {
+        name: "chr1".into(),
+        length: 2_000_000,
+    }];
+    let tmp = std::env::temp_dir().join(format!("cooler_rs_chunked_{}.hic", std::process::id()));
+
+    let pixels: Vec<Pixel> = (0..300i64)
+        .map(|i| Pixel {
+            bin1_id: i,
+            bin2_id: i,
+            count: (i + 1) as f64,
+        })
+        .collect();
+    {
+        let mut w = HicWriter::create(&tmp, "test", &chroms, &[5000]).unwrap();
+        // Three chunks, every one landing in the same (chr1, chr1) pair.
+        for chunk in pixels.chunks(100) {
+            w.add_pixel_chunk(5000, chunk).unwrap();
+        }
+        w.finish_resolution(5000).unwrap();
+        w.finalize().unwrap();
+    }
+
+    let hic = HiCFile::open(&tmp).unwrap();
+    let mut want: Vec<_> = pixels
+        .iter()
+        .map(|p| (p.bin1_id, p.bin2_id, p.count.to_bits()))
+        .collect();
+    let mut got: Vec<_> = hic
+        .pixels(5000)
+        .unwrap()
+        .iter()
+        .map(|p| (p.bin1_id, p.bin2_id, p.count.to_bits()))
+        .collect();
+    want.sort_unstable();
+    got.sort_unstable();
+    assert_eq!(
+        want.len(),
+        got.len(),
+        "pixels split across chunks were dropped"
+    );
+    assert_eq!(want, got);
+
+    std::fs::remove_file(&tmp).ok();
+}
+
 /// v9 fixture (`tests/data/PRJCA014302_At-MNase-allReps-filtered.hic`), also
 /// gitignored. Its v9 block header carries two extra per-axis width flags, so
 /// the v6-v8 parse silently misreads it.

@@ -92,10 +92,11 @@ pub fn dense_txt_to_pixels(text: &str) -> Result<(usize, Vec<Pixel>)> {
 /// the bins are not a uniform `div_ceil(chrom.length, resolution)` tiling
 /// (the only binning `.hic` can represent), or when a chromosome is named
 /// `All` (reserved for the genome-wide pseudo-chromosome).
-// ponytail: Bounded-RAM contract — at most one resolution's classify data
-// (≈ chunk_size × ~32 B/entry) is held in RAM at a time during streaming;
-// per-resolution classified pixels spill to scratch files under the writer's
-// tempdir. One `Cooler` HDF5 handle is open at a time. Upgrade path: if disk
+// ponytail: Bounded-RAM contract — at most one chromosome pair's classify
+// data is held in RAM at a time (≈ chunk_size × ~32 B/entry while streaming;
+// one pair's full pixel set while finalizing); per-pair classified pixels
+// spill to scratch files under the writer's tempdir. One `Cooler` HDF5 handle
+// is open at a time. Upgrade path: if disk
 // I/O dominates at petabyte scale, swap scratch tempfiles for a streaming
 // block-level protocol (e.g. write classified blocks directly into the .hic
 // matrix body as they're produced, hold only the per-res block index).

@@ -194,6 +194,22 @@ impl HiCFile {
     /// Returns `symmetric-upper` pixels (`bin1_id <= bin2_id`) over the
     /// non-`All` chromosomes.
     pub fn pixels(&self, resolution: u32) -> Result<Vec<Pixel>> {
+        let mut pixels = Vec::new();
+        self.for_each_pixel(resolution, |p| {
+            pixels.push(p);
+            Ok(())
+        })?;
+        Ok(pixels)
+    }
+
+    /// Stream every pixel at `resolution` to `f` without materializing the
+    /// matrix. Same pixels and order as [`HiCFile::pixels`], but peak RAM is
+    /// one block rather than the whole resolution — a fine-resolution matrix
+    /// runs to hundreds of millions of pixels, several GB as a `Vec`.
+    pub fn for_each_pixel<F>(&self, resolution: u32, mut f: F) -> Result<()>
+    where
+        F: FnMut(Pixel) -> Result<()>,
+    {
         // Map header chromosome index -> non-All index (skip the "All" chrom).
         let real_indices: Vec<usize> = (0..self.chroms.len())
             .filter(|&i| !is_all_chrom(&self.chroms[i].name))
@@ -212,7 +228,6 @@ impl HiCFile {
 
         let entries = self.index.clone();
         let mut file = self.file.lock().expect("hic lock poisoned");
-        let mut pixels = Vec::new();
         for entry in &entries {
             let c1 = header_to_cooler[entry.chrom1];
             let c2 = header_to_cooler[entry.chrom2];
@@ -222,15 +237,15 @@ impl HiCFile {
             let meta = read_matrix(&mut file, *entry, resolution)?;
             for block in &meta.blocks {
                 for (bin_x, bin_y, count) in read_block(&mut file, block, self.version)? {
-                    pixels.push(Pixel {
+                    f(Pixel {
                         bin1_id: offsets[c1] + bin_x as i64,
                         bin2_id: offsets[c2] + bin_y as i64,
                         count,
-                    });
+                    })?;
                 }
             }
         }
-        Ok(pixels)
+        Ok(())
     }
 
     /// Header attribute dictionary.
@@ -647,11 +662,16 @@ const ALL_SCALE_FACTOR: i64 = 1000;
 /// Accepts pixels per resolution (like [`CoolerWriter::write_pixels`]) and
 /// writes a valid v8 file including the genome-wide `All` pseudo-chromosome.
 /// Pixels are streamed: each [`add_pixel_chunk`] classifies into (c1,c2)
-/// groups and appends to a per-resolution tempfile under `scratch`. The
-/// `All` matrix is built incrementally during the finest-resolution pass.
-/// [`finalize`] reads each per-resolution tempfile once to write matrix
-/// records. RAM footprint is bounded by one resolution's classify data at
-/// a time (plus chunk-sized pending buffer during streaming).
+/// groups and appends to a per-*pair* tempfile under `scratch`. The `All`
+/// matrix is built incrementally during the finest-resolution pass.
+/// [`finalize`] reads one pair's tempfile, writes its matrix record, and
+/// drops it before moving on. RAM footprint is bounded by one chromosome
+/// pair's classify data (plus chunk-sized pending buffer while streaming).
+///
+/// Scratch is pair-major rather than resolution-major because a `.hic` matrix
+/// record carries the block index for *every* resolution of its pair: a
+/// resolution-major scratch forces all resolutions into RAM at once to build
+/// that record, which is what made a 14-resolution genome OOM.
 pub struct HicWriter {
     file: File,
     genome_id: String,
@@ -667,10 +687,12 @@ pub struct HicWriter {
     /// dropped at writer drop which deletes them.
     #[allow(dead_code)]
     scratch: TempDir,
-    /// Per-resolution append-only scratch writer; flushed at `finish_resolution`.
-    pixel_scratch_writers: BTreeMap<u32, BufWriter<File>>,
-    /// Per-resolution scratch path, kept for finalize-time reopen.
-    pixel_scratch_paths: BTreeMap<u32, PathBuf>,
+    /// Per-chromosome-pair append-only scratch writer; flushed at
+    /// `finish_resolution`. Keyed pair-major (not by resolution) so that
+    /// `finalize` can build one matrix record holding a single pair.
+    pixel_scratch_writers: BTreeMap<(usize, usize), BufWriter<File>>,
+    /// Per-pair scratch path, kept for finalize-time reopen.
+    pixel_scratch_paths: BTreeMap<(usize, usize), PathBuf>,
     /// Resolutions whose `finish_resolution` (or `add_pixels` wrapper) has been called.
     finished: BTreeSet<u32>,
     /// Genome-wide coarsening of finest-resolution pixels into the `All` matrix.
@@ -749,14 +771,19 @@ impl HicWriter {
         let bin_size_scaled = (bin_size as i64 / ALL_SCALE_FACTOR).max(1) as i32;
         let all_n_bins = (total_bins as u64).div_ceil(factor) as i64;
 
-        // Pre-create one scratch file per resolution.
+        // Pre-create one scratch file per chromosome pair. Scratch is
+        // pair-major: a pair's pixels for *every* resolution land in one file,
+        // so `finalize` builds each matrix record holding only that pair
+        // instead of every resolution at once.
         let mut pixel_scratch_writers = BTreeMap::new();
         let mut pixel_scratch_paths = BTreeMap::new();
-        for &res in &resolutions {
-            let path = scratch.path().join(format!("pixels-{res}.bin"));
-            let f = File::create(&path)?;
-            pixel_scratch_paths.insert(res, path);
-            pixel_scratch_writers.insert(res, BufWriter::new(f));
+        for c1 in 0..n_real {
+            for c2 in c1..n_real {
+                let path = scratch.path().join(format!("pixels-{c1}-{c2}.bin"));
+                let f = File::create(&path)?;
+                pixel_scratch_paths.insert((c1, c2), path);
+                pixel_scratch_writers.insert((c1, c2), BufWriter::new(f));
+            }
         }
 
         Ok(HicWriter {
@@ -824,8 +851,8 @@ impl HicWriter {
     /// Append one chunk of pixels for `resolution`. Pixels must be in
     /// symmetric-upper form (`bin1_id <= bin2_id`, global bin ids). Chunks
     /// within a resolution need not be in any particular order. The chunk
-    /// is classified and appended to a per-resolution tempfile; only one
-    /// chunk's worth of classify state is held in RAM at a time.
+    /// is classified and appended to a per-pair tempfile; only one chunk's
+    /// worth of classify state is held in RAM at a time.
     pub fn add_pixel_chunk(&mut self, resolution: u32, pixels: &[Pixel]) -> Result<()> {
         if !self.resolutions.contains(&resolution) {
             return Err(Error::InvalidInput(format!(
@@ -875,15 +902,14 @@ impl HicWriter {
             }
         }
 
-        // Append to the per-resolution scratch file. (c1,c2) groups are
-        // written in lex order so finalize can read each scratch once.
-        let writer = self
-            .pixel_scratch_writers
-            .get_mut(&resolution)
-            .ok_or_else(|| Error::Format(format!("missing scratch for {resolution}")))?;
+        // Append to the per-pair scratch file, tagging each record with its
+        // resolution.
         for ((c1, c2), recs) in &pairs {
-            writer.write_u32::<LittleEndian>(*c1 as u32)?;
-            writer.write_u32::<LittleEndian>(*c2 as u32)?;
+            let writer = self
+                .pixel_scratch_writers
+                .get_mut(&(*c1, *c2))
+                .ok_or_else(|| Error::Format(format!("missing scratch for pair ({c1}, {c2})")))?;
+            writer.write_u32::<LittleEndian>(resolution)?;
             writer.write_u32::<LittleEndian>(recs.len() as u32)?;
             for &(bx, by, count) in recs {
                 writer.write_i64::<LittleEndian>(bx)?;
@@ -908,7 +934,9 @@ impl HicWriter {
                 "resolution {resolution} was already finalized via finish_resolution"
             )));
         }
-        if let Some(mut w) = self.pixel_scratch_writers.remove(&resolution) {
+        // Scratch is pair-major, so one resolution's data is spread over every
+        // pair file: flush them all (they stay open for the next resolution).
+        for w in self.pixel_scratch_writers.values_mut() {
             w.flush()?;
         }
         self.finished.insert(resolution);
@@ -963,43 +991,25 @@ impl HicWriter {
         // resolution's scratch at a time, accumulating per-(c1,c2) ResSpec
         // vectors into a shared map. After all res are folded, the map's pairs
         // are drained sequentially into matrix records.
-        let mut pair_specs: BTreeMap<(usize, usize), Vec<ResSpec>> = BTreeMap::new();
-        for &res in &self.resolutions {
-            let res_pairs = self.read_res_scratch(res)?;
-            for (&(c1, c2), pixels) in &res_pairs {
-                let n_bins1 = (self.chroms[c1].length as u64).div_ceil(res as u64) as i64;
-                pair_specs.entry((c1, c2)).or_default().push(ResSpec {
-                    bin_size: res as i64,
-                    n_bins1,
-                    pixels: pixels.clone(),
-                });
-            }
-            // res_pairs freed at end of iteration.
-        }
-
-        // Matrices: each real pair, then All:All.
+        // Matrices: each real pair, then All:All. Scratch is pair-major, so a
+        // pair's pixels for every resolution are read, written and dropped
+        // before the next pair is touched — RAM held is one pair, not one
+        // resolution of every pair. Resolutions with no pixels for the pair
+        // become empty specs, keeping the sub-record order identical to
+        // `self.resolutions`.
         let mut footers: Vec<(String, i64, i32)> = Vec::new();
         for c1 in 0..n_real {
             for c2 in c1..n_real {
-                let specs = pair_specs.remove(&(c1, c2)).unwrap_or_default();
-                // Resolutions were pushed in coarse-to-fine order. The matrix
-                // record sub-records must be in that same order; append any
-                // missing resolutions as empty specs.
-                let mut specs = specs;
-                if specs.len() < self.resolutions.len() {
-                    for &res in &self.resolutions {
-                        let already = specs.iter().any(|s| s.bin_size == res as i64);
-                        if !already {
-                            let n_bins1 =
-                                (self.chroms[c1].length as u64).div_ceil(res as u64) as i64;
-                            specs.push(ResSpec {
-                                bin_size: res as i64,
-                                n_bins1,
-                                pixels: Vec::new(),
-                            });
-                        }
-                    }
-                }
+                let mut by_res = self.read_pair_scratch(c1, c2)?;
+                let specs: Vec<ResSpec> = self
+                    .resolutions
+                    .iter()
+                    .map(|&res| ResSpec {
+                        bin_size: res as i64,
+                        n_bins1: (self.chroms[c1].length as u64).div_ceil(res as u64) as i64,
+                        pixels: by_res.remove(&res).unwrap_or_default(),
+                    })
+                    .collect();
                 let (pos, size) =
                     self.write_matrix_body((c1 + 1) as i32, (c2 + 1) as i32, &specs)?;
                 footers.push((format!("{}_{}", c1 + 1, c2 + 1), pos, size));
@@ -1091,24 +1101,23 @@ impl HicWriter {
         Ok(())
     }
 
-    /// Read one resolution's per-pair classified pixels back from its scratch
-    /// tempfile. Returns a `BTreeMap<(c1,c2), Vec<(bx,by,count)>>` for this
-    /// resolution only. RAM held: one resolution's nnz pixels at a time.
-    fn read_res_scratch(&self, resolution: u32) -> Result<BTreeMap<(usize, usize), PairPixels>> {
+    /// Read one chromosome pair's classified pixels back from its scratch
+    /// tempfile, grouped by resolution. RAM held: this pair's nnz pixels —
+    /// scratch is pair-major precisely so `finalize` never needs another pair.
+    fn read_pair_scratch(&self, c1: usize, c2: usize) -> Result<BTreeMap<u32, PairPixels>> {
         use std::io::ErrorKind;
         let path = self
             .pixel_scratch_paths
-            .get(&resolution)
-            .ok_or_else(|| Error::Format(format!("missing scratch path for {resolution}")))?;
+            .get(&(c1, c2))
+            .ok_or_else(|| Error::Format(format!("missing scratch path for pair ({c1}, {c2})")))?;
         let mut reader = std::io::BufReader::new(File::open(path)?);
-        let mut out: BTreeMap<(usize, usize), PairPixels> = BTreeMap::new();
+        let mut out: BTreeMap<u32, PairPixels> = BTreeMap::new();
         loop {
-            let c1 = match reader.read_u32::<LittleEndian>() {
+            let res = match reader.read_u32::<LittleEndian>() {
                 Ok(v) => v,
                 Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             };
-            let c2 = reader.read_u32::<LittleEndian>()?;
             let n = reader.read_u32::<LittleEndian>()?;
             let mut recs = Vec::with_capacity(n as usize);
             for _ in 0..n {
@@ -1117,7 +1126,11 @@ impl HicWriter {
                 let count = reader.read_f64::<LittleEndian>()?;
                 recs.push((bx, by, count));
             }
-            out.insert((c1 as usize, c2 as usize), recs);
+            // One resolution is written once per `add_pixel_chunk` call, so a
+            // resolution whose pixels span several chunks arrives as several
+            // records. Append them: `insert` would keep only the last chunk's
+            // slice and silently drop the rest.
+            out.entry(res).or_default().extend(recs);
         }
         Ok(out)
     }
