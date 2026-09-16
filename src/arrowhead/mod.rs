@@ -419,16 +419,74 @@ pub fn call_domains(
     Ok(per_chrom?.into_iter().flatten().collect())
 }
 
-fn ordered_set_difference(a: &[HighScore], b: &[HighScore]) -> Vec<HighScore> {
-    let set_b: HashSet<HighScore> = b.iter().copied().collect();
-    let mut seen = HashSet::new();
-    let mut diff = Vec::new();
-    for &s in a {
-        if !set_b.contains(&s) && seen.insert(s) {
-            diff.push(s);
+/// Java's narrowing `(int)` conversion of a double: NaN to 0, saturating.
+fn java_double_to_int(x: f64) -> i32 {
+    if x.is_nan() {
+        0
+    } else if x >= i32::MAX as f64 {
+        i32::MAX
+    } else if x <= i32::MIN as f64 {
+        i32::MIN
+    } else {
+        x as i32
+    }
+}
+
+/// `HighScore.hashCode` as juicer 1.22.01 defines it, spread the way
+/// `HashMap.hash` does (`h ^ (h >>> 16)`), so the bucket index matches Java's.
+fn java_hash(s: &HighScore) -> u32 {
+    let floor = (s.score + s.u_var + s.l_var + s.up_sign + s.lo_sign).floor();
+    let h = 7i32
+        .wrapping_mul((s.i as i32).wrapping_add(s.j as i32))
+        .wrapping_mul(java_double_to_int(floor));
+    (h ^ ((h as u32) >> 16) as i32) as u32
+}
+
+/// The order `new java.util.HashSet<>(items)` would iterate `items` in, as
+/// indices into `items`: bucket-table order, insertion order within a bucket,
+/// first insertion winning for duplicates.
+///
+/// Juicer's `orderedSetDifference` iterates a `HashSet`, and the list it
+/// returns feeds `appendNonConflictingBlocks`, which drops blocks that overlap
+/// anything already accepted — so this order is part of the result.
+///
+/// `HashSet(Collection)` sizes the backing table as
+/// `tableSizeFor(max(ceil(n / 0.75), 16))` — verified against this JDK by
+/// reflecting into the map (`n` = 12/24/48 give 16/32/64, the older
+/// `(int)(n/0.75f)+1` rule gives 32/64/128). Order is a JVM implementation
+/// detail, so this deliberately mirrors the JDK the reference jar is run on.
+///
+/// ponytail: no resize or treeification is simulated — the bucket count is
+/// sized for the whole input up front, so neither can trigger at these sizes
+/// (an 8-deep bucket would need 8 keys sharing a table slot).
+fn java_hashset_order(items: &[HighScore]) -> Vec<usize> {
+    let need = (items.len() as f64 / 0.75).ceil() as i32;
+    let mut cap = need.max(16);
+    let mut pow2 = 1i32;
+    while pow2 < cap {
+        pow2 <<= 1;
+    }
+    cap = pow2;
+
+    let mut table: Vec<Vec<usize>> = vec![Vec::new(); cap as usize];
+    for (idx, s) in items.iter().enumerate() {
+        let bucket = &mut table[(java_hash(s) as usize) & (cap as usize - 1)];
+        if !bucket.iter().any(|&k| items[k] == *s) {
+            bucket.push(idx);
         }
     }
-    diff
+    table.into_iter().flatten().collect()
+}
+
+/// Set difference in the order juicer's `orderedSetDifference` produces: the
+/// `HashSet` iteration order of `a` (see [`java_hashset_order`]) minus `b`.
+fn ordered_set_difference(a: &[HighScore], b: &[HighScore]) -> Vec<HighScore> {
+    let set_b: HashSet<HighScore> = b.iter().copied().collect();
+    java_hashset_order(a)
+        .into_iter()
+        .map(|i| a[i])
+        .filter(|s| !set_b.contains(s))
+        .collect()
 }
 
 fn filter_blocks_by_size(blocks: Vec<HighScore>, min_width: usize) -> Vec<HighScore> {
@@ -567,6 +625,57 @@ mod tests {
         let d = directionality_index_upstream(&m, 2);
         assert!((d[[4, 6]] - (-0.5)).abs() < 1e-12);
         assert_eq!(d[[6, 4]], 0.0); // lower triangle untouched
+    }
+
+    #[test]
+    fn java_hashset_order_matches_the_jvm() {
+        // The expected order is what `new java.util.HashSet<>(list)` iterates
+        // under juicer 1.22.01's HighScore.hashCode, printed by running the real
+        // jar classes over exactly this list. The last two entries duplicate
+        // earlier ones (indices 0 and 13) and are dropped.
+        let rows: &[(i64, i64, f64, f64, f64, f64, f64)] = &[
+            (0, 5, 0.9843, 0.2441, 0.3187, 0.6445, 0.7500),
+            (2, 9, 0.1100, 0.2200, 0.3300, 0.4400, 0.5500),
+            (2, 9, 0.1100, 0.2200, 0.3300, 0.4400, 0.5500),
+            (4, 20, 1.4455, 0.0500, 0.0500, 0.9000, 0.1000),
+            (7, 8, 0.7731, 0.1200, 0.2100, 0.3300, 0.4100),
+            (7, 19, 2.0000, 0.0100, 0.0200, 0.0300, 0.0400),
+            (11, 12, 0.4512, 0.9988, 0.0012, 0.5000, 0.5000),
+            (13, 30, 0.9001, 0.1111, 0.2222, 0.3333, 0.4444),
+            (13, 31, 0.9001, 0.1111, 0.2222, 0.3333, 0.4445),
+            (17, 18, 1.0000, 0.0000, 0.0000, 1.0000, 1.0000),
+            (19, 40, 0.3333, 0.6666, 0.9999, 0.1234, 0.5678),
+            (23, 24, 0.2500, 0.7500, 0.1250, 0.3750, 0.6250),
+            (29, 30, 0.1111, 0.2222, 0.3333, 0.4444, 0.5555),
+            (31, 44, 0.8888, 0.7777, 0.6666, 0.5555, 0.4444),
+            (37, 38, 0.1010, 0.2020, 0.3030, 0.4040, 0.5050),
+            (41, 50, 0.9090, 0.8080, 0.7070, 0.6060, 0.5050),
+            (43, 44, 0.1357, 0.2468, 0.3579, 0.4680, 0.5791),
+            (47, 60, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000),
+            (53, 54, 0.5000, 0.5000, 0.5000, 0.5000, 0.5000),
+            (59, 70, 1.2345, 0.6789, 0.1011, 0.1213, 0.1415),
+            (0, 5, 0.9843, 0.2441, 0.3187, 0.6445, 0.7500),
+            (61, 72, 0.0111, 0.0222, 0.0333, 0.0444, 0.0555),
+            (67, 80, 0.9999, 0.0001, 0.0002, 0.0003, 0.0004),
+            (71, 84, 0.1234, 0.2345, 0.3456, 0.4567, 0.5678),
+        ];
+        let items: Vec<HighScore> = rows
+            .iter()
+            .map(|&(i, j, score, u_var, l_var, up_sign, lo_sign)| HighScore {
+                i,
+                j,
+                score,
+                u_var,
+                l_var,
+                up_sign,
+                lo_sign,
+            })
+            .collect();
+
+        assert_eq!(
+            java_hashset_order(&items),
+            [17, 21, 16, 6, 22, 0, 13, 8, 4, 5, 1, 14, 19, 3, 11, 15, 7, 10, 18, 12, 23, 9]
+        );
     }
 
     #[test]

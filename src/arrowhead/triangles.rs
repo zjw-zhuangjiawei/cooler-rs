@@ -43,9 +43,20 @@ fn upper(m: &Array2<f64>, max_size: usize) -> Array2<f64> {
 }
 
 /// Divide a matrix by its largest element (`normalizeByMax` in juicer).
+///
+/// Mirrors juicer byte-for-byte: `calculateMax` seeds from `[0][0]` and tests
+/// `max < val` (so a NaN at `[0][0]` poisons the result and later NaNs never
+/// raise the max), and `scalarMultiply(1 / max)` multiplies by the *reciprocal*
+/// rather than dividing — a different rounding.
 fn normalize_by_max(m: &Array2<f64>) -> Array2<f64> {
-    let max = m.iter().fold(f64::NEG_INFINITY, |a, &v| a.max(v));
-    m.mapv(|v| v / max)
+    let mut max = m[[0, 0]];
+    for &v in m.iter() {
+        if max < v {
+            max = v;
+        }
+    }
+    let inv = 1.0 / max;
+    m.mapv(|v| v * inv)
 }
 
 /// Replace every `0.0` with `1.0` (so element-wise division below is safe).

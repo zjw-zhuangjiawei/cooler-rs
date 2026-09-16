@@ -2,3 +2,6 @@
 **/*.rs.bk
 /tests/data/*.mcool
 /tests/data/*.hic
+# Upstream reference sources (juicer_tools 1.22.01 etc.), extracted for alignment
+# only — not ours to redistribute.
+/reference
