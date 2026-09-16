@@ -1,9 +1,9 @@
 //! Read-only `.hic` (Hi-C) contact matrix reader.
 //!
-//! Implements format v6-v8 (the layout documented in `HiCFormatV8.md` and
-//! followed by the reference `straw` reader). Blocks are zlib (deflate)
-//! compressed. Only base-pair resolution matrices are supported; fragment
-//! resolution levels, if present, are skipped.
+//! Implements format v6-v9 (the layouts documented in `HiCFormatV8.md` /
+//! `HiCFormatV9.md` and followed by the reference `straw` reader). Blocks are
+//! zlib (deflate) compressed. Only base-pair resolution matrices are
+//! supported; fragment resolution levels, if present, are skipped.
 //!
 //! Data is returned in the same shape as [`Cooler`](crate::Cooler): a flat
 //! vector of [`Pixel`]s in `symmetric-upper` form (`bin1_id <= bin2_id`), with
@@ -38,6 +38,11 @@ pub struct HiCFile {
     index: Vec<IndexEntry>,
     /// File offset of the footer (master index, expected values, norm index).
     footer_pos: u64,
+    /// v9+ only: file offset of the normalization vector index, recorded in the
+    /// header (`nviPosition`). v9 dropped that section from the footer, so the
+    /// footer walk cannot find it. `None` for v6-v8 and for v9 files whose
+    /// header carries no position.
+    norm_index_pos: Option<u64>,
     /// Header attribute dictionary (key/value string pairs).
     attributes: BTreeMap<String, String>,
 }
@@ -77,20 +82,26 @@ impl HiCFile {
             ));
         }
 
+        // v6 is the oldest layout `straw` and hictk still read; v9 is the
+        // newest either of them supports.
         let version = file.read_i32::<LittleEndian>()?;
-        if version < 6 {
+        if !(6..=9).contains(&version) {
             return Err(Error::Format(format!(
-                ".hic version {version} is not supported (need >= 6)"
+                ".hic version {version} is not supported (need 6..=9)"
             )));
         }
 
         let master_index_pos = file.read_i64::<LittleEndian>()? as u64;
         let genome_id = read_cstring(&mut file)?;
 
-        // v9+ stores an extra (nviPosition, nviLength) pair; we target <= v8.
+        // v9+ stores an extra (nviPosition, nviLength) pair.
+        let mut norm_index_pos = None;
         if version > 8 {
-            file.read_i64::<LittleEndian>()?;
-            file.read_i64::<LittleEndian>()?;
+            let pos = file.read_i64::<LittleEndian>()?;
+            file.read_i64::<LittleEndian>()?; // nviLength
+            if pos > 0 {
+                norm_index_pos = Some(pos as u64);
+            }
         }
 
         // Attribute dictionary (key/value string pairs).
@@ -149,6 +160,7 @@ impl HiCFile {
             resolutions,
             index,
             footer_pos: master_index_pos,
+            norm_index_pos,
             attributes,
         })
     }
@@ -209,7 +221,7 @@ impl HiCFile {
             }
             let meta = read_matrix(&mut file, *entry, resolution)?;
             for block in &meta.blocks {
-                for (bin_x, bin_y, count) in read_block(&mut file, block)? {
+                for (bin_x, bin_y, count) in read_block(&mut file, block, self.version)? {
                     pixels.push(Pixel {
                         bin1_id: offsets[c1] + bin_x as i64,
                         bin2_id: offsets[c2] + bin_y as i64,
@@ -287,18 +299,27 @@ impl HiCFile {
         Ok(Some(values))
     }
 
-    /// Walk the footer to the normalization-vector index and return its entries.
+    /// Seek to the normalization-vector index and return its entries.
+    ///
+    /// v9 records the index offset in the header and dropped the index from the
+    /// footer, so the header position is the only way in. v6-v8 have no such
+    /// field: there the index follows the footer's expected-value sections,
+    /// which have to be walked.
     fn read_norm_entries(&self) -> Result<Vec<NormEntry>> {
         let mut file = self.file.lock().expect("hic lock poisoned");
         let f: &mut File = &mut file;
-        f.seek(SeekFrom::Start(self.footer_pos))?;
-        // Footer size in bytes.
+
         if self.version > 8 {
-            f.read_i64::<LittleEndian>()?;
-        } else {
-            f.read_i32::<LittleEndian>()?;
+            let Some(pos) = self.norm_index_pos else {
+                return Ok(Vec::new());
+            };
+            f.seek(SeekFrom::Start(pos))?;
+            return read_norm_index(f, self.version);
         }
-        // Master index.
+
+        f.seek(SeekFrom::Start(self.footer_pos))?;
+        f.read_i32::<LittleEndian>()?; // footer size in bytes
+                                       // Master index.
         let n = f.read_i32::<LittleEndian>()?;
         for _ in 0..n {
             read_cstring(f)?;
@@ -313,30 +334,34 @@ impl HiCFile {
         // Expected value vectors, then normalized expected value vectors.
         skip_expected_section(f, self.version, false)?;
         skip_expected_section(f, self.version, true)?;
-        // Normalization vector index.
-        let n = f.read_i32::<LittleEndian>()?;
-        let mut out = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            let name = read_cstring(f)?;
-            let chrom_idx = f.read_i32::<LittleEndian>()?;
-            let unit = read_cstring(f)?;
-            let resolution = f.read_i32::<LittleEndian>()? as u32;
-            let position = f.read_i64::<LittleEndian>()? as u64;
-            let _size = if self.version > 8 {
-                f.read_i64::<LittleEndian>()? as u64
-            } else {
-                f.read_i32::<LittleEndian>()? as u32 as u64
-            };
-            out.push(NormEntry {
-                name,
-                chrom_idx,
-                unit,
-                resolution,
-                position,
-            });
-        }
-        Ok(out)
+        read_norm_index(f, self.version)
     }
+}
+
+/// Read the normalization-vector index (count, then one record per vector).
+fn read_norm_index<R: Read>(f: &mut R, version: i32) -> Result<Vec<NormEntry>> {
+    let n = f.read_i32::<LittleEndian>()?;
+    let mut out = Vec::with_capacity(n.max(0) as usize);
+    for _ in 0..n {
+        let name = read_cstring(f)?;
+        let chrom_idx = f.read_i32::<LittleEndian>()?;
+        let unit = read_cstring(f)?;
+        let resolution = f.read_i32::<LittleEndian>()? as u32;
+        let position = f.read_i64::<LittleEndian>()? as u64;
+        let _size = if version > 8 {
+            f.read_i64::<LittleEndian>()? as u64
+        } else {
+            f.read_i32::<LittleEndian>()? as u32 as u64
+        };
+        out.push(NormEntry {
+            name,
+            chrom_idx,
+            unit,
+            resolution,
+            position,
+        });
+    }
+    Ok(out)
 }
 
 /// `"All"` (case-insensitive) is the genome-wide pseudo-chromosome.
@@ -467,7 +492,7 @@ fn read_matrix(file: &mut File, entry: IndexEntry, resolution: u32) -> Result<Ma
 /// Decompress and decode one block into `(bin_x, bin_y, count)` records.
 ///
 /// `bin_x`/`bin_y` are block-relative (already offset by the block's origin).
-fn read_block(file: &mut File, block: &Block) -> Result<Vec<(i32, i32, f64)>> {
+fn read_block(file: &mut File, block: &Block, version: i32) -> Result<Vec<(i32, i32, f64)>> {
     if block.size == 0 {
         return Ok(Vec::new());
     }
@@ -482,29 +507,49 @@ fn read_block(file: &mut File, block: &Block) -> Result<Vec<(i32, i32, f64)>> {
         .map_err(|e| Error::Format(format!("zlib decompression failed: {e}")))?;
 
     let mut cur = Cursor::new(raw);
+
+    // v6 blocks carry no per-block header: `nRecords` followed directly by
+    // `nRecords` × (i32 bin_x, i32 bin_y, f32 count). Bins are
+    // chromosome-relative already, so there is no offset to add.
+    if version == 6 {
+        let n_records = cur.read_i32::<LittleEndian>()?;
+        let mut out = Vec::with_capacity(n_records.max(0) as usize);
+        for _ in 0..n_records {
+            let bin_x = cur.read_i32::<LittleEndian>()?;
+            let bin_y = cur.read_i32::<LittleEndian>()?;
+            let count = cur.read_f32::<LittleEndian>()? as f64;
+            out.push((bin_x, bin_y, count));
+        }
+        return Ok(out);
+    }
+
     let _n_records = cur.read_i32::<LittleEndian>()?;
     let bin_x_offset = cur.read_i32::<LittleEndian>()?;
     let bin_y_offset = cur.read_i32::<LittleEndian>()?;
-    // 0 => short counts, non-zero => float counts (inverted from the spec's
-    // `useFloat` flag, matching the reference straw reader).
-    let use_short = cur.read_u8()? == 0;
+    // 0 => 16-bit, non-zero => 32-bit (inverted from the spec's flag names,
+    // matching the reference straw reader).
+    let short_counts = cur.read_u8()? == 0;
+    // v9 adds one width flag per bin axis; v7/v8 are always 16-bit.
+    let (short_x, short_y) = if version > 8 {
+        (cur.read_u8()? == 0, cur.read_u8()? == 0)
+    } else {
+        (true, true)
+    };
     let representation = cur.read_u8()?;
 
     let mut out = Vec::new();
     match representation {
         1 => {
-            // Sparse "list of rows".
-            let row_count = cur.read_i16::<LittleEndian>()?;
+            // Sparse "list of rows". Row numbers and row widths use the y-axis
+            // width, column numbers and column counts the x-axis width (mirrors
+            // hictk's `read_type1_block`).
+            let row_count = read_bin_field(&mut cur, short_y)?;
             for _ in 0..row_count {
-                let bin_y = bin_y_offset + cur.read_i16::<LittleEndian>()? as i32;
-                let col_count = cur.read_i16::<LittleEndian>()?;
+                let bin_y = bin_y_offset + read_bin_field(&mut cur, short_y)?;
+                let col_count = read_bin_field(&mut cur, short_x)?;
                 for _ in 0..col_count {
-                    let bin_x = bin_x_offset + cur.read_i16::<LittleEndian>()? as i32;
-                    let count = if use_short {
-                        cur.read_i16::<LittleEndian>()? as f64
-                    } else {
-                        cur.read_f32::<LittleEndian>()? as f64
-                    };
+                    let bin_x = bin_x_offset + read_bin_field(&mut cur, short_x)?;
+                    let count = read_count_field(&mut cur, short_counts)?;
                     out.push((bin_x, bin_y, count));
                 }
             }
@@ -518,19 +563,10 @@ fn read_block(file: &mut File, block: &Block) -> Result<Vec<(i32, i32, f64)>> {
                 let col = i - row * w;
                 let bin_x = bin_x_offset + col as i32;
                 let bin_y = bin_y_offset + row as i32;
-                let count = if use_short {
-                    let c = cur.read_i16::<LittleEndian>()?;
-                    if c == -32768 {
-                        continue; // sentinel for an empty dense cell
-                    }
-                    c as f64
-                } else {
-                    let c = cur.read_f32::<LittleEndian>()?;
-                    if c.is_nan() {
-                        continue;
-                    }
-                    c as f64
-                };
+                let count = read_count_field(&mut cur, short_counts)?;
+                if count.is_nan() {
+                    continue; // sentinel for an empty dense cell
+                }
                 out.push((bin_x, bin_y, count));
             }
         }
@@ -542,6 +578,31 @@ fn read_block(file: &mut File, block: &Block) -> Result<Vec<(i32, i32, f64)>> {
     }
 
     Ok(out)
+}
+
+/// Read a block bin coordinate: 16- or 32-bit per the block's width flag.
+fn read_bin_field<R: Read>(cur: &mut R, short: bool) -> Result<i32> {
+    Ok(if short {
+        cur.read_i16::<LittleEndian>()? as i32
+    } else {
+        cur.read_i32::<LittleEndian>()?
+    })
+}
+
+/// Read a block count: 16- or 32-bit per the block's width flag. The 16-bit
+/// sentinel (`i16::MIN`) marks an empty dense cell; it is mapped to NaN so
+/// callers have a single emptiness test.
+fn read_count_field<R: Read>(cur: &mut R, short: bool) -> Result<f64> {
+    Ok(if short {
+        let c = cur.read_i16::<LittleEndian>()?;
+        if c == i16::MIN {
+            f64::NAN
+        } else {
+            c as f64
+        }
+    } else {
+        cur.read_f32::<LittleEndian>()? as f64
+    })
 }
 
 /// Read a null-terminated UTF-8 string (byteorder has no such helper).

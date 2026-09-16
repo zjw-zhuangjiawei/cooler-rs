@@ -105,6 +105,33 @@ fn roundtrips_pixels() {
     std::fs::remove_file(&tmp).ok();
 }
 
+/// v9 fixture (`tests/data/PRJCA014302_At-MNase-allReps-filtered.hic`), also
+/// gitignored. Its v9 block header carries two extra per-axis width flags, so
+/// the v6-v8 parse silently misreads it.
+fn v9_fixture() -> Option<std::path::PathBuf> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/PRJCA014302_At-MNase-allReps-filtered.hic");
+    p.exists().then_some(p)
+}
+
+#[test]
+fn reads_a_v9_file() {
+    let Some(path) = v9_fixture() else {
+        eprintln!("skipping: PRJCA014302_At-MNase-allReps-filtered.hic not present");
+        return;
+    };
+    let hic = HiCFile::open(&path).unwrap();
+    assert_eq!(hic.version(), 9);
+    assert_eq!(hic.chromosomes().len(), 5);
+
+    // Genome-wide pixels at the coarsest resolution (5 Mb), identity-checked
+    // against `hictk dump --resolution 5000000 -t pixels` (row count and sum).
+    let pixels = hic.pixels(5_000_000).unwrap();
+    assert_eq!(pixels.len(), 528);
+    let sum: f64 = pixels.iter().map(|p| p.count).sum();
+    assert_eq!(sum, 880_614_561.0);
+}
+
 #[test]
 fn reads_normalization_vectors() {
     let Some(path) = fixture() else {
