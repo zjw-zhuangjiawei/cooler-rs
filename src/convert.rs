@@ -73,12 +73,20 @@ pub fn dense_txt_to_pixels(text: &str) -> Result<(usize, Vec<Pixel>)> {
 /// `genome_id` is stored in the `.hic` header — `.cool`/`.mcool` carry no
 /// genome identifier, so the caller supplies one. When `weight_col` names a
 /// column of the input `bins` table (e.g. `"weight"`), its per-bin values are
-/// copied verbatim into the `.hic` footer as divisive normalization vectors,
-/// named `weight_name` (or the column name when `weight_name` is `None`);
-/// resolutions lacking the column are skipped with a log line. Copying is
-/// verbatim: `.hic` consumers *divide* by these vectors while cooler `bins`
-/// weights are conventionally multiplicative biases, so choosing the column
-/// and its `.hic` name (juicer looks up `KR`/`VC`) is the operator's call.
+/// written to the `.hic` footer as normalization vectors named `weight_name`
+/// (or the column name when `weight_name` is `None`); resolutions lacking the
+/// column are skipped with a log line.
+///
+/// The values are **inverted** on the way out. A `.hic` consumer divides by
+/// the vector (`count / (v1 * v2)`, juicer's convention) while a cooler
+/// `bins/weight` column is a multiplicative bias (`count * w1 * w2`, cooler's
+/// convention), so a verbatim copy balances the matrix by the reciprocal of
+/// the intended factor — off by `w^4`, and absurd in magnitude. hictk inverts
+/// too (`convert/cool_to_hic.cpp`).
+// ponytail: unconditionally inverts, i.e. assumes the column is multiplicative
+// — true for cooler's `weight` and for this crate's own balance/Raichu output.
+// A cooler file can mark a column divisive with a `divisive_weights` attribute;
+// honour that here if such a file ever shows up.
 ///
 /// Fails before writing when the input is not a fixed-bin-size cooler, when
 /// the bins are not a uniform `div_ceil(chrom.length, resolution)` tiling
@@ -180,7 +188,13 @@ pub fn cooler_to_hic<P: AsRef<Path>, Q: AsRef<Path>>(
         if let Some(col) = weight_col {
             let name = weight_name.unwrap_or(col);
             if cool.bins_has_column(col)? {
-                let vectors = split_bins_column(&cool, &chroms, col)?;
+                let mut vectors = split_bins_column(&cool, &chroms, col)?;
+                // cooler weights multiply, `.hic` normalization vectors divide.
+                for (_, values) in &mut vectors {
+                    for w in values.iter_mut() {
+                        *w = 1.0 / *w;
+                    }
+                }
                 writer.add_normalization_vectors(res, name, &vectors)?;
             } else {
                 log::info!(

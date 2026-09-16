@@ -119,8 +119,12 @@ fn mcool_to_hic_converts_all_resolutions() {
     }
 }
 
+/// The `bins/weight` column is a *multiplicative* bias; a `.hic` normalization
+/// vector is *divisive*. The two are reciprocal, so the conversion must invert
+/// — copying the column through verbatim would balance the output matrix by
+/// the reciprocal of the intended factor.
 #[test]
-fn cool_to_hic_copies_weight_column() {
+fn cool_to_hic_inverts_weight_column() {
     let dir = tempfile::tempdir().unwrap();
     let cool_path = dir.path().join("in.cool");
     let hic_path = dir.path().join("out.hic");
@@ -140,11 +144,11 @@ fn cool_to_hic_copies_weight_column() {
     assert_eq!(hic.avail_normalizations().unwrap(), vec!["KR".to_string()]);
     assert_eq!(
         hic.norm_vector(100_000, "chr1", "KR").unwrap().unwrap(),
-        vec![0.5, 1.0, 2.0] // chr1 has 3 bins
+        vec![2.0, 1.0, 0.5] // chr1 has 3 bins; 1/w of [0.5, 1.0, 2.0]
     );
     assert_eq!(
         hic.norm_vector(100_000, "chr2", "KR").unwrap().unwrap(),
-        vec![4.0] // chr2 has 1 bin
+        vec![0.25] // chr2 has 1 bin; 1/w of [4.0]
     );
     // Pixels unchanged by the norm copy.
     let src_pixels = Cooler::open(&cool_path).unwrap().pixels().unwrap();
@@ -186,10 +190,11 @@ fn mcool_partial_weight_column_is_skipped_when_absent() {
         hic.avail_normalizations().unwrap(),
         vec!["weight".to_string()]
     );
-    // Weight present at the coarse resolution that carries the column…
+    // Weight present (inverted) at the coarse resolution that carries the
+    // column…
     assert_eq!(
         hic.norm_vector(100_000, "chr1", "weight").unwrap().unwrap(),
-        vec![0.5, 1.0, 2.0]
+        vec![2.0, 1.0, 0.5]
     );
     // …and absent (None, not an error) where the column does not exist.
     assert_eq!(hic.norm_vector(50_000, "chr1", "weight").unwrap(), None);
