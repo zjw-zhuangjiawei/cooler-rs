@@ -70,6 +70,6 @@ fn targets(path: &Path, res: Option<u64>) -> cooler_rs::Result<Vec<(String, Cool
     };
     selected
         .into_iter()
-        .map(|r| Ok((format!("/resolutions/{r}"), mcool.cooler(r)?)))
+        .map(|r| Ok((format!("/{}", mcool.group_path(r)?), mcool.cooler(r)?)))
         .collect()
 }

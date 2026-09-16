@@ -219,8 +219,9 @@ fn resolve_cooler(input: &Path, res: Option<u64>) -> cooler_rs::Result<(Cooler, 
                 )));
             }
         };
+        let path = format!("/{}", mcool.group_path(res)?);
         let cool = mcool.cooler(res)?;
-        Ok((cool, format!("/resolutions/{res}")))
+        Ok((cool, path))
     } else {
         Err(Error::InvalidInput(
             "input must be a .cool or .mcool file".into(),

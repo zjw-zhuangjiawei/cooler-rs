@@ -293,6 +293,9 @@ fn reads_a_legacy_v1_mcool() {
 
     let mcool = Mcool::open(&path).unwrap();
     assert_eq!(mcool.resolutions().unwrap(), [100_000, 200_000]);
+    // The group name is the zoom level, not the bin size.
+    assert_eq!(mcool.group_path(100_000).unwrap(), "1");
+    assert_eq!(mcool.group_path(200_000).unwrap(), "0");
     assert_eq!(mcool.cooler(100_000).unwrap().chroms().unwrap(), chroms);
     assert_eq!(
         mcool.cooler(200_000).unwrap().bin_size().unwrap(),

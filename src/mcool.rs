@@ -156,18 +156,22 @@ impl Mcool {
         Ok(resolutions)
     }
 
+    /// HDF5 path of a resolution's group — `/resolutions/<bin_size>`, or the
+    /// zoom-level group for the legacy layout, where the two differ.
+    pub fn group_path(&self, bin_size: u64) -> Result<String> {
+        if !self.legacy {
+            return Ok(format!("{RESOLUTIONS_GROUP}/{bin_size}"));
+        }
+        legacy_layout(&self.file)?
+            .into_iter()
+            .find(|(bs, _)| *bs == bin_size)
+            .map(|(_, name)| name)
+            .ok_or_else(|| Error::Format(format!("resolution {bin_size} not found")))
+    }
+
     /// Open the cooler collection for a given resolution.
     pub fn cooler(&self, bin_size: u64) -> Result<Cooler> {
-        let path = if self.legacy {
-            let name = legacy_layout(&self.file)?
-                .into_iter()
-                .find(|(bs, _)| *bs == bin_size)
-                .map(|(_, name)| name)
-                .ok_or_else(|| Error::Format(format!("resolution {bin_size} not found")))?;
-            name
-        } else {
-            format!("{RESOLUTIONS_GROUP}/{bin_size}")
-        };
+        let path = self.group_path(bin_size)?;
         let group = self
             .file
             .group(&path)
