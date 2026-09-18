@@ -297,9 +297,9 @@ struct HicexplorerOptions {
     max_depth: Option<i64>,
 
     /// First step (bp) between window lengths; later steps grow as
-    /// `step * x**1.5`. (`--step` itself belongs to `call-tad armatus`.)
-    #[arg(long = "window-step", value_name = "BP")]
-    window_step: Option<i64>,
+    /// `step * x**1.5`
+    #[arg(long = "step", value_name = "BP")]
+    step: Option<i64>,
 
     /// Minimum drop of a boundary below the mean score of the bins around it
     #[arg(long = "delta", value_name = "F", default_value_t = 0.01)]
@@ -358,7 +358,7 @@ fn run_hicexplorer(common: &CommonArgs, hx: &HicexplorerOptions) -> cooler_rs::R
     let params = findtads::Params {
         min_depth: hx.min_depth,
         max_depth: hx.max_depth,
-        step: hx.window_step,
+        step: hx.step,
         delta: hx.delta,
         min_boundary_distance: hx.min_boundary_distance,
         correction: match hx.correction {

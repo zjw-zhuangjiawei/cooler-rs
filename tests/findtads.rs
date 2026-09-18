@@ -125,9 +125,8 @@ fn chromosome_subset_matches_hicexplorer() {
 
 /// The flag surface has to survive clap's own consistency check: two
 /// arguments sharing an id panic at runtime rather than at build time, and
-/// only a real parse catches it. `hicexplorer` shares `--norm` with
-/// `arrowhead` and would collide with armatus's `--step` if the window step
-/// were named that.
+/// only a real parse catches it. `--norm` and `--step` are what would collide
+/// if the methods shared one command instead of a subcommand each.
 #[test]
 fn call_tad_flags_parse() {
     let help = |args: &[&str]| {
@@ -141,7 +140,7 @@ fn call_tad_flags_parse() {
 
     assert!(help(&["call-tad", "--help"]).contains("hicexplorer"));
     let hx = help(&["call-tad", "hicexplorer", "--help"]);
-    assert!(hx.contains("--window-step"), "{hx}");
+    assert!(hx.contains("--step"), "{hx}");
     assert!(hx.contains("--norm"), "{hx}");
 }
 

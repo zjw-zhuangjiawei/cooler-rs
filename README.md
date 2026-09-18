@@ -118,7 +118,7 @@ cargo run --release -- compare /tmp/toy.cool /tmp/toy2.cool --metric scc --metri
 
 # hicFindTADs TAD boundaries, genome-wide (weights come from a bins column)
 cargo run --release -- call-tad hicexplorer /tmp/toy.cool --norm weight \
-    --min-depth 60000 --max-depth 180000 --window-step 20000 -o TADs
+    --min-depth 60000 --max-depth 180000 --step 20000 -o TADs
 ```
 
 Run `cooler-rs <COMMAND> --help` for the full option list of each subcommand.
