@@ -306,6 +306,14 @@ impl Band {
         // pool to `NaN` (`if maxdepth and bin_dist_plus_one == 0`). Key 0 only
         // exists for inter-chromosomal cells, which `perchr=True` never puts in
         // a band, so it is unreachable here and no guard is kept for it.
+        // TODO(reproduce-hicexplorer): a cell whose key runs past `depth + 1` is
+        // left at the zero `transf_ma` started as, and `eliminate_zeros` then
+        // drops it from the written matrix. It still counts towards the pool
+        // statistics above -- the original skips only the assignment, not the
+        // accumulation. The cutoff only bites where a large bin offset also
+        // spans many masked bins: on the 40 kb CNP0007920 leaf matrix it is 635
+        // cells, all on the chromosome that lost the most bins.
+        let cutoff = self.depth + 1;
         for d in 0..self.depth {
             let len = n - d;
             if len == 0 {
@@ -320,7 +328,9 @@ impl Band {
             let column = &mut self.values[d];
             for (i, v) in column.iter_mut().enumerate() {
                 let k = key(i, d);
-                *v = if std[k] == 0.0 {
+                *v = if k > cutoff {
+                    0.0
+                } else if std[k] == 0.0 {
                     f64::NAN
                 } else {
                     (*v - mu[k]) / std[k]
