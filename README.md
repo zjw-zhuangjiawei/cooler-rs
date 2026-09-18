@@ -10,18 +10,21 @@ plus the `cooler-rs` command-line tool for Hi-C analysis.
   `.cool` and multi-resolution `.mcool` files following the cooler schema
   (bin table, sparse pixel matrix, chromosome offsets).
 - **CLI**: a single `cooler-rs` binary:
-  - `cooler-rs call-tad` — TAD calling (`--method ontad`, a port of
-    [OnTAD v1.4](https://github.com/anlin00007/OnTAD); `--method domaincaller`,
-    a TADLib port; `--method armatus`, an
-    [Armatus 2.3](https://github.com/kingsfordgroup/armatus) port;
-    `--method hicexplorer`, HiCExplorer's `hicFindTADs`: z-scores the matrix
-    per chromosome, scores every bin with the mean z-score of the contacts
-    crossing it over a range of window sizes (the TAD-separation score), and
-    calls a boundary at each local minimum that clears the delta and
-    significance filters. Writes `_tad_score.bm`, `_zscore_matrix.cool`,
-    `_boundaries.bed`, `_boundaries.gff`, `_domains.bed` and
-    `_score.bedgraph`; runs genome-wide, and takes `--chromosomes` for a
-    subset).
+  - `cooler-rs call-tad` — TAD calling, one subcommand per algorithm:
+    - `call-tad ontad` — a port of
+      [OnTAD v1.4](https://github.com/anlin00007/OnTAD)
+    - `call-tad domaincaller` — a TADLib port
+    - `call-tad armatus` — an
+      [Armatus 2.3](https://github.com/kingsfordgroup/armatus) port
+    - `call-tad arrowhead` — a juicer Arrowhead port
+    - `call-tad hicexplorer` — HiCExplorer's `hicFindTADs`: z-scores the
+      matrix per chromosome, scores every bin with the mean z-score of the
+      contacts crossing it over a range of window sizes (the TAD-separation
+      score), and calls a boundary at each local minimum that clears the delta
+      and significance filters. Writes `_tad_score.bm`, `_zscore_matrix.cool`,
+      `_boundaries.bed`, `_boundaries.gff`, `_domains.bed` and
+      `_score.bedgraph`; runs genome-wide, and takes `--chromosomes` for a
+      subset.
   - `cooler-rs convert` — format conversion (e.g. `--from dense-txt`, a dense
     N×N text matrix to `.cool`).
   - `cooler-rs zoomify` — coarsen a single-resolution `.cool` into a
@@ -85,13 +88,13 @@ for res in mcool.resolutions()? {
 cargo run --example generate /tmp/toy
 
 # Hierarchical TAD calling (OnTAD, default)
-cargo run --release -- call-tad /tmp/toy.cool --method ontad --chr chr1 -o out
+cargo run --release -- call-tad ontad /tmp/toy.cool --chr chr1 -o out
 
 # DomainCaller TAD calling (TADLib port; writes .domains + .DIs.bedGraph)
-cargo run --release -- call-tad /tmp/toy.cool --method domaincaller --chr chr1 -o out
+cargo run --release -- call-tad domaincaller /tmp/toy.cool --chr chr1 -o out
 
 # Armatus TAD calling (multiresolution; writes .consensus.txt)
-cargo run --release -- call-tad /tmp/toy.cool --method armatus --chr chr1 --gamma 0.5 -o out
+cargo run --release -- call-tad armatus /tmp/toy.cool --chr chr1 --gamma 0.5 -o out
 
 # Dense matrix -> .cool
 cargo run --release -- convert --from dense-txt matrix.txt -o out.cool -L 250000000 -r 100000
@@ -114,7 +117,7 @@ cargo run --release -- normalize /tmp/toy.cool --method raichu
 cargo run --release -- compare /tmp/toy.cool /tmp/toy2.cool --metric scc --metric pearson -o heatmap
 
 # hicFindTADs TAD boundaries, genome-wide (weights come from a bins column)
-cargo run --release -- call-tad /tmp/toy.cool --method hicexplorer --norm weight \
+cargo run --release -- call-tad hicexplorer /tmp/toy.cool --norm weight \
     --min-depth 60000 --max-depth 180000 --window-step 20000 -o TADs
 ```
 

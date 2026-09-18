@@ -1,7 +1,8 @@
 //! `cooler-rs` — unified command-line interface for the cooler-rs crate.
 //!
 //! Subcommands:
-//!   `call-tad`  call TADs from a .cool/.mcool contact matrix (`--method`)
+//!   `call-tad`  call TADs from a .cool/.mcool contact matrix, one
+//!               subcommand per algorithm
 //!   `compare`   compare multiple matrices and plot a correlation heatmap
 //!   `convert`   convert other matrix formats to/from cooler format
 //!   `normalize` normalize a contact matrix (ic or raichu)
@@ -25,7 +26,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Call TADs from a .cool/.mcool contact matrix (`--method`)
+    /// Call TADs from a .cool/.mcool contact matrix
     CallTad(Box<cli::call_tad::CallTadArgs>),
     /// Compare multiple contact matrices and plot a correlation heatmap
     Compare(cli::compare::CompareArgs),

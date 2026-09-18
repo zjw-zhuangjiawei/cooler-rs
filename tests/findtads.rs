@@ -123,19 +123,26 @@ fn chromosome_subset_matches_hicexplorer() {
     );
 }
 
-/// The flag surface has to survive clap's own consistency check: two option
-/// groups sharing an argument id panic at runtime rather than at build time,
-/// and only a real parse catches it.
+/// The flag surface has to survive clap's own consistency check: two
+/// arguments sharing an id panic at runtime rather than at build time, and
+/// only a real parse catches it. `hicexplorer` shares `--norm` with
+/// `arrowhead` and would collide with armatus's `--step` if the window step
+/// were named that.
 #[test]
 fn call_tad_flags_parse() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cooler-rs"))
-        .args(["call-tad", "--help"])
-        .output()
-        .expect("run cooler-rs");
-    assert!(out.status.success(), "call-tad --help failed");
-    let help = String::from_utf8_lossy(&out.stdout);
-    assert!(help.contains("hicexplorer"), "missing method: {help}");
-    assert!(help.contains("--window-step"), "missing flag: {help}");
+    let help = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cooler-rs"))
+            .args(args)
+            .output()
+            .expect("run cooler-rs");
+        assert!(out.status.success(), "{args:?} failed");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    assert!(help(&["call-tad", "--help"]).contains("hicexplorer"));
+    let hx = help(&["call-tad", "hicexplorer", "--help"]);
+    assert!(hx.contains("--window-step"), "{hx}");
+    assert!(hx.contains("--norm"), "{hx}");
 }
 
 /// The window sizes are the step function the whole scoring stage is built

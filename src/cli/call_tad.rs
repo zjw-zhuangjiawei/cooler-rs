@@ -1,16 +1,15 @@
 //! `cooler-rs call-tad` — call hierarchical TADs from a Hi-C contact matrix.
 //!
-//! The `--method` flag selects the TAD calling algorithm. Each method has its
-//! own option group (flattened into the help output under a per-method
-//! heading); method-specific fields are `Option<T>` so that defaults are
-//! resolved in `run()` and explicitly-set options can be validated against
-//! the selected method.
+//! The TAD calling algorithm is a subcommand. Every method shares
+//! [`CommonArgs`] (input, output prefix, chromosome, resolution, threads,
+//! log2, normalization) and adds its own option group; method-specific fields
+//! are `Option<T>` so the defaults are resolved in `run()`.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use clap::{Args, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 use rand::Rng;
 
 use cooler_rs::armatus;
@@ -20,58 +19,26 @@ use cooler_rs::findtads::{self, MultipleTesting};
 use cooler_rs::ontad::{self, Params};
 use cooler_rs::{ChromMeta, Cooler, Error, File, Mcool};
 
-/// TAD calling method.
-#[derive(Clone, Copy, ValueEnum)]
-pub enum TadMethod {
-    /// OnTAD v1.4 (An et al., Genome Biology 2019; Rust port)
-    Ontad,
-    /// DomainCaller (Dixon et al., Nature 2012; Rust port of TADLib)
-    Domaincaller,
-    /// Armatus 2.3 (Filippova et al., Algorithms Mol Biol 2014; Rust port)
-    Armatus,
-    /// Arrowhead (Huntley & Durand, Cell Syst 2016; Rust port of juicer)
-    Arrowhead,
-    /// hicFindTADs (HiCExplorer): TAD-separation score and boundary caller
-    Hicexplorer,
-}
-
-/// Multiple-testing correction for the hicFindTADs boundary p-values.
-#[derive(Clone, Copy, ValueEnum)]
-enum Correction {
-    /// Benjamini-Hochberg false discovery rate (q-value).
-    Fdr,
-    /// Bonferroni family-wise error rate (p-value).
-    Bonferroni,
-    /// Raw p-values, no correction.
-    #[value(alias = "None")]
-    None,
-}
-
+/// Arguments every `call-tad` method shares.
 #[derive(Args)]
-pub struct CallTadArgs {
+struct CommonArgs {
     /// Input file (.cool or .mcool)
     #[arg(value_name = "INPUT")]
     input: PathBuf,
 
-    /// TAD calling method
-    #[arg(long, value_enum, value_name = "METHOD", default_value = "ontad")]
-    method: TadMethod,
-
-    /// Output prefix (default: input file name)
+    /// Output prefix (default: the input file name)
     #[arg(short = 'o', long, value_name = "PREFIX")]
     output: Option<String>,
 
-    /// Chromosome to extract
+    /// Chromosome to extract (methods that work on a single chromosome)
     #[arg(long = "chr", value_name = "NAME")]
     chr: Option<String>,
 
-    /// Resolution to use (.mcool input)
+    /// Resolution to use (.mcool or .hic input)
     #[arg(long = "res", value_name = "N")]
     res: Option<u64>,
 
-    /// Worker threads for arrowhead's per-window/chromosome parallelism.
-    /// Default is conservative: each window allocates hundreds of MB, so more
-    /// threads can thrash memory and run slower than fewer.
+    /// Worker threads, for the per-window and per-chromosome parallelism
     #[arg(long, value_name = "N", default_value_t = 4)]
     threads: usize,
 
@@ -83,49 +50,112 @@ pub struct CallTadArgs {
     /// normalization type for a `.hic`; `NONE` means raw counts)
     #[arg(long, value_name = "NAME")]
     norm: Option<String>,
+}
 
+impl CommonArgs {
+    /// The input path as a string, which every runner keys its output names
+    /// off.
+    fn fin(&self) -> String {
+        self.input.display().to_string()
+    }
+
+    /// The output prefix: `-o` when given, the input path otherwise.
+    fn prefix(&self) -> String {
+        self.output.clone().unwrap_or_else(|| self.fin())
+    }
+}
+
+/// Which TAD caller to run.
+#[derive(Subcommand)]
+enum Method {
+    /// OnTAD v1.4 (An et al., Genome Biology 2019; Rust port)
+    Ontad(OntadArgs),
+
+    /// DomainCaller (Dixon et al., Nature 2012; Rust port of TADLib)
+    Domaincaller(DomaincallerArgs),
+
+    /// Armatus 2.3 (Filippova et al., Algorithms Mol Biol 2014; Rust port)
+    Armatus(ArmatusArgs),
+
+    /// Arrowhead (Huntley & Durand, Cell Syst 2016; Rust port of juicer)
+    Arrowhead(ArrowheadArgs),
+
+    /// hicFindTADs (HiCExplorer): TAD-separation score and boundary caller
+    Hicexplorer(HicexplorerArgs),
+}
+
+#[derive(Args)]
+pub struct CallTadArgs {
+    #[command(subcommand)]
+    method: Method,
+}
+
+#[derive(Args)]
+struct OntadArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     #[command(flatten)]
     ontad: OntadOptions,
+}
 
+#[derive(Args)]
+struct DomaincallerArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
+#[derive(Args)]
+struct ArmatusArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     #[command(flatten)]
     armatus: ArmatusOptions,
+}
 
+#[derive(Args)]
+struct ArrowheadArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     #[command(flatten)]
     arrowhead: ArrowheadOptions,
+}
 
+#[derive(Args)]
+struct HicexplorerArgs {
+    #[command(flatten)]
+    common: CommonArgs,
     #[command(flatten)]
     hicexplorer: HicexplorerOptions,
 }
 
-/// Options specific to `--method ontad`.
 #[derive(Args)]
 struct OntadOptions {
     /// Penalty for adding a TAD
-    #[arg(long, value_name = "F", help_heading = "OnTAD options")]
+    #[arg(long, value_name = "F")]
     penalty: Option<f64>,
 
     /// Maximum TAD size in bins
-    #[arg(long, value_name = "N", help_heading = "OnTAD options")]
+    #[arg(long, value_name = "N")]
     maxsz: Option<usize>,
 
     /// Minimum TAD size in bins
-    #[arg(long, value_name = "N", help_heading = "OnTAD options")]
+    #[arg(long, value_name = "N")]
     minsz: Option<usize>,
 
     /// Local-minimum window half-size
-    #[arg(long, value_name = "N", help_heading = "OnTAD options")]
+    #[arg(long, value_name = "N")]
     lsize: Option<usize>,
 
     /// Local-minimum threshold in stddevs
-    #[arg(long, value_name = "F", help_heading = "OnTAD options")]
+    #[arg(long, value_name = "F")]
     ldiff: Option<f64>,
 
     /// Shuffle each diagonal (null model)
-    #[arg(long, help_heading = "OnTAD options")]
+    #[arg(long)]
     shuffle: bool,
 
     /// Also write a .bed file
-    #[arg(long, help_heading = "OnTAD options")]
+    #[arg(long)]
     bedout: bool,
 }
 
@@ -148,31 +178,31 @@ impl OntadOptions {
 #[derive(Args)]
 struct ArmatusOptions {
     /// Highest gamma (resolution) to generate domains at
-    #[arg(long, value_name = "G", help_heading = "Armatus options")]
+    #[arg(long, value_name = "G")]
     gamma: Option<f64>,
 
     /// Step size between resolutions
-    #[arg(long, value_name = "S", help_heading = "Armatus options")]
+    #[arg(long, value_name = "S")]
     step: Option<f64>,
 
     /// Number of near-optimal solutions per resolution
-    #[arg(long, value_name = "K", help_heading = "Armatus options")]
+    #[arg(long, value_name = "K")]
     top_k: Option<usize>,
 
     /// Minimum samples required to compute a per-size mean
-    #[arg(long, value_name = "N", help_heading = "Armatus options")]
+    #[arg(long, value_name = "N")]
     min_mean_samples: Option<usize>,
 
     /// Only generate domains at the maximum gamma
-    #[arg(long, help_heading = "Armatus options")]
+    #[arg(long)]
     just_gamma_max: bool,
 
     /// Also write per-resolution domain files
-    #[arg(long, help_heading = "Armatus options")]
+    #[arg(long)]
     multiscale: bool,
 
     /// Apply natural log to positive counts (Armatus sparse/Rao semantics)
-    #[arg(long, help_heading = "Armatus options")]
+    #[arg(long)]
     log: bool,
 }
 
@@ -192,35 +222,35 @@ impl ArmatusOptions {
 #[derive(Args)]
 struct ArrowheadOptions {
     /// Sliding-window width along the diagonal, in bins
-    #[arg(long, value_name = "N", help_heading = "Arrowhead options")]
+    #[arg(long, value_name = "N")]
     window: Option<usize>,
 
     /// High-confidence variance threshold
-    #[arg(long, value_name = "F", help_heading = "Arrowhead options")]
+    #[arg(long, value_name = "F")]
     var_threshold: Option<f64>,
 
     /// High-confidence sign threshold
-    #[arg(long, value_name = "F", help_heading = "Arrowhead options")]
+    #[arg(long, value_name = "F")]
     high_sign: Option<f64>,
 
     /// Low-confidence sign threshold sweep start (max)
-    #[arg(long, value_name = "F", help_heading = "Arrowhead options")]
+    #[arg(long, value_name = "F")]
     max_low_sign: Option<f64>,
 
     /// Low-confidence sign threshold sweep end (min)
-    #[arg(long, value_name = "F", help_heading = "Arrowhead options")]
+    #[arg(long, value_name = "F")]
     min_low_sign: Option<f64>,
 
     /// Low-confidence sign threshold sweep step
-    #[arg(long, value_name = "F", help_heading = "Arrowhead options")]
+    #[arg(long, value_name = "F")]
     decrement_low_sign: Option<f64>,
 
     /// Minimum domain width, in bins
-    #[arg(long, value_name = "N", help_heading = "Arrowhead options")]
+    #[arg(long, value_name = "N")]
     min_block_size: Option<usize>,
 
     /// Upstream/downstream gap for the directionality index
-    #[arg(long, value_name = "N", help_heading = "Arrowhead options")]
+    #[arg(long, value_name = "N")]
     gap: Option<usize>,
 }
 
@@ -239,6 +269,18 @@ impl ArrowheadOptions {
     }
 }
 
+/// Multiple-testing correction for the hicFindTADs boundary p-values.
+#[derive(Clone, Copy, ValueEnum)]
+enum Correction {
+    /// Benjamini-Hochberg false discovery rate (q-value).
+    Fdr,
+    /// Bonferroni family-wise error rate (p-value).
+    Bonferroni,
+    /// Raw p-values, no correction.
+    #[value(alias = "None")]
+    None,
+}
+
 /// Options specific to `--method hicexplorer`.
 ///
 /// hicFindTADs runs genome-wide by default and takes a *list* of chromosomes,
@@ -247,45 +289,24 @@ impl ArrowheadOptions {
 #[derive(Args)]
 struct HicexplorerOptions {
     /// Window length (bp) considered to each side of a bin, at minimum
-    #[arg(
-        long = "min-depth",
-        value_name = "BP",
-        help_heading = "hicFindTADs options"
-    )]
+    #[arg(long = "min-depth", value_name = "BP")]
     min_depth: Option<i64>,
 
     /// Window length (bp) considered to each side of a bin, at maximum
-    #[arg(
-        long = "max-depth",
-        value_name = "BP",
-        help_heading = "hicFindTADs options"
-    )]
+    #[arg(long = "max-depth", value_name = "BP")]
     max_depth: Option<i64>,
 
     /// First step (bp) between window lengths; later steps grow as
-    /// `step * x**1.5`. (`--step` itself belongs to `--method armatus`.)
-    #[arg(
-        long = "window-step",
-        value_name = "BP",
-        help_heading = "hicFindTADs options"
-    )]
+    /// `step * x**1.5`. (`--step` itself belongs to `call-tad armatus`.)
+    #[arg(long = "window-step", value_name = "BP")]
     window_step: Option<i64>,
 
     /// Minimum drop of a boundary below the mean score of the bins around it
-    #[arg(
-        long = "delta",
-        value_name = "F",
-        default_value_t = 0.01,
-        help_heading = "hicFindTADs options"
-    )]
+    #[arg(long = "delta", value_name = "F", default_value_t = 0.01)]
     delta: f64,
 
     /// Minimum distance between boundaries (bp); defaults to four bins
-    #[arg(
-        long = "min-boundary-distance",
-        value_name = "BP",
-        help_heading = "hicFindTADs options"
-    )]
+    #[arg(long = "min-boundary-distance", value_name = "BP")]
     min_boundary_distance: Option<i64>,
 
     /// Multiple-testing correction
@@ -293,8 +314,7 @@ struct HicexplorerOptions {
         long = "correct-for-multiple-testing",
         value_enum,
         value_name = "METHOD",
-        default_value = "fdr",
-        help_heading = "hicFindTADs options"
+        default_value = "fdr"
     )]
     correction: Correction,
 
@@ -302,8 +322,7 @@ struct HicexplorerOptions {
     #[arg(
         long = "threshold-comparisons",
         value_name = "F",
-        default_value_t = 0.01,
-        help_heading = "hicFindTADs options"
+        default_value_t = 0.01
     )]
     threshold_comparisons: f64,
 
@@ -312,20 +331,17 @@ struct HicexplorerOptions {
         long = "chromosomes",
         value_name = "NAME",
         num_args = 1..,
-        help_heading = "hicFindTADs options"
     )]
     chromosomes: Option<Vec<String>>,
 }
 
 pub fn run(args: CallTadArgs) -> cooler_rs::Result<()> {
-    let fin = args.input.display().to_string();
-
     match args.method {
-        TadMethod::Ontad => run_ontad(&args, &fin),
-        TadMethod::Domaincaller => run_domaincaller(&args, &fin),
-        TadMethod::Armatus => run_armatus(&args, &fin),
-        TadMethod::Arrowhead => run_arrowhead(&args, &fin),
-        TadMethod::Hicexplorer => run_hicexplorer(&args, &fin),
+        Method::Ontad(a) => run_ontad(&a.common, &a.ontad),
+        Method::Domaincaller(a) => run_domaincaller(&a.common),
+        Method::Armatus(a) => run_armatus(&a.common, &a.armatus),
+        Method::Arrowhead(a) => run_arrowhead(&a.common, &a.arrowhead),
+        Method::Hicexplorer(a) => run_hicexplorer(&a.common, &a.hicexplorer),
     }
 }
 
@@ -335,9 +351,9 @@ pub fn run(args: CallTadArgs) -> cooler_rs::Result<()> {
 /// writes a whole set of files rather than one TAD list, so it takes the
 /// cooler straight from `open_cooler_file` instead of the per-chromosome
 /// offsets the other runners need.
-fn run_hicexplorer(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
-    let cooler = open_cooler_file(args, fin)?;
-    let hx = &args.hicexplorer;
+fn run_hicexplorer(common: &CommonArgs, hx: &HicexplorerOptions) -> cooler_rs::Result<()> {
+    let fin = common.fin();
+    let cooler = open_cooler_file(common, &fin)?;
 
     let params = findtads::Params {
         min_depth: hx.min_depth,
@@ -351,12 +367,12 @@ fn run_hicexplorer(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
             Correction::None => MultipleTesting::None,
         },
         threshold_comparisons: hx.threshold_comparisons,
-        norm: args.norm.clone(),
+        norm: common.norm.clone(),
         chromosomes: hx
             .chromosomes
             .clone()
-            .or_else(|| args.chr.clone().map(|c| vec![c])),
-        out_prefix: args.output.clone().unwrap_or_else(|| fin.to_string()),
+            .or_else(|| common.chr.clone().map(|c| vec![c])),
+        out_prefix: common.prefix(),
     };
 
     log::info!(
@@ -366,17 +382,17 @@ fn run_hicexplorer(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
         params.threshold_comparisons,
         params.norm,
         params.chromosomes,
-        args.threads
+        common.threads
     );
     let t0 = Instant::now();
 
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(args.threads)
+        .num_threads(common.threads)
         .build()
         .map_err(|e| {
             Error::InvalidInput(format!(
                 "cannot build thread pool with {} threads: {e}",
-                args.threads
+                common.threads
             ))
         })?;
     let outputs = pool.install(|| findtads::run_cooler(&cooler, &params))?;
@@ -393,7 +409,7 @@ fn run_hicexplorer(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
 
 /// Resolve the input into a `Cooler` at the requested resolution, without
 /// selecting a chromosome.
-fn open_cooler_file(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<Cooler> {
+fn open_cooler_file(args: &CommonArgs, fin: &str) -> cooler_rs::Result<Cooler> {
     if fin.ends_with(".cool") {
         Cooler::open_any(fin)
     } else if fin.ends_with(".mcool") {
@@ -421,13 +437,13 @@ fn open_cooler_file(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<Cooler> 
 /// Resolve the input into a `Cooler` and the selected chromosome's first/last
 /// bin offsets (shared by the per-method runners).
 fn open_cooler(
-    args: &CallTadArgs,
+    common: &CommonArgs,
     fin: &str,
 ) -> cooler_rs::Result<(Cooler, usize, usize, ChromMeta)> {
-    let cool = open_cooler_file(args, fin)?;
+    let cool = open_cooler_file(common, fin)?;
 
     let chroms = cool.chroms()?;
-    let chrom_id = match args.chr.as_deref() {
+    let chrom_id = match common.chr.as_deref() {
         Some(name) => chroms.iter().position(|c| c.name == name).ok_or_else(|| {
             let available = chroms
                 .iter()
@@ -465,11 +481,12 @@ fn open_cooler(
     Ok((cool, first, last, meta))
 }
 
-fn run_domaincaller(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
+fn run_domaincaller(common: &CommonArgs) -> cooler_rs::Result<()> {
+    let fin = common.fin();
     log::info!("DomainCaller (Rust port of TADLib)");
     let t0 = Instant::now();
 
-    let (cool, first, last, meta) = open_cooler(args, fin)?;
+    let (cool, first, last, meta) = open_cooler(common, &fin)?;
     let res = meta.resolution as usize;
     let n = last - first;
 
@@ -497,7 +514,7 @@ fn run_domaincaller(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
         t0.elapsed()
     );
 
-    let prefix = args.output.as_deref().unwrap_or(fin);
+    let prefix = common.prefix();
     let fdom = format!("{prefix}.domains");
     let fdi = format!("{prefix}.DIs.bedGraph");
 
@@ -517,8 +534,9 @@ fn run_domaincaller(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     Ok(())
 }
 
-fn run_armatus(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
-    let params = args.armatus.params();
+fn run_armatus(common: &CommonArgs, opts: &ArmatusOptions) -> cooler_rs::Result<()> {
+    let fin = common.fin();
+    let params = opts.params();
     log::info!(
         "Armatus 2.3 (Rust port): gamma_max={}, step={}, top_k={}, min_mean_samples={}",
         params.gamma_max,
@@ -528,17 +546,22 @@ fn run_armatus(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     );
     let t0 = Instant::now();
 
-    let prefix = args.output.as_deref().unwrap_or(fin);
+    let prefix = common.prefix();
 
-    if let Some(_chr) = args.chr.as_deref() {
-        let (cool, first, last, meta) = open_cooler(args, fin)?;
+    if let Some(_chr) = common.chr.as_deref() {
+        let (cool, first, last, meta) = open_cooler(common, &fin)?;
         let res = meta.resolution as usize;
         log::info!(" Loaded {meta} bins", meta = last - first);
-        let (domains, ensemble) = armatus_for_chrom(&cool, first, last, args.armatus.log, &params)?;
+        let (domains, ensemble) = armatus_for_chrom(&cool, first, last, opts.log, &params)?;
         let fout = format!("{prefix}.consensus.txt");
         write_domains_bed(&fout, &[(meta.name.as_str(), &domains)], res)?;
-        if args.armatus.multiscale {
-            write_multiscale(prefix, &[(meta.name.as_str(), ensemble)], res, params.top_k)?;
+        if opts.multiscale {
+            write_multiscale(
+                &prefix,
+                &[(meta.name.as_str(), ensemble)],
+                res,
+                params.top_k,
+            )?;
         }
         log::info!(" Called {} domains ({:.1?})", domains.len(), t0.elapsed());
         log::info!("Output to {fout}");
@@ -549,7 +572,7 @@ fn run_armatus(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     // matrices are dense (n*n f64); skipping huge chroms is the caller's job
     // (--chr). We keep this serial — the matrix allocation per chromosome is
     // the bottleneck, and parallelism would just multiply peak memory.
-    let cool = open_cooler_file(args, fin)?;
+    let cool = open_cooler_file(common, &fin)?;
     let chroms = cool.chroms()?;
     let offsets = cool.chrom_offset()?;
     let res =
@@ -570,7 +593,7 @@ fn run_armatus(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
             continue;
         }
         log::info!(" [{}/{}] {}: {} bins", i + 1, n, chrom.name, last - first);
-        let (domains, ensemble) = armatus_for_chrom(&cool, first, last, args.armatus.log, &params)?;
+        let (domains, ensemble) = armatus_for_chrom(&cool, first, last, opts.log, &params)?;
         total += domains.len();
         for d in &domains {
             writeln!(
@@ -581,13 +604,13 @@ fn run_armatus(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
                 (d.end + 1) * res - 1
             )?;
         }
-        if args.armatus.multiscale {
+        if opts.multiscale {
             multi_buf.push((chrom.name.as_str(), ensemble));
         }
     }
 
-    if args.armatus.multiscale && !multi_buf.is_empty() {
-        write_multiscale(prefix, &multi_buf, res, params.top_k)?;
+    if opts.multiscale && !multi_buf.is_empty() {
+        write_multiscale(&prefix, &multi_buf, res, params.top_k)?;
     }
 
     log::info!(
@@ -677,8 +700,9 @@ fn write_multiscale(
     Ok(())
 }
 
-fn run_ontad(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
-    let params = args.ontad.params();
+fn run_ontad(common: &CommonArgs, opts: &OntadOptions) -> cooler_rs::Result<()> {
+    let fin = common.fin();
+    let params = opts.params();
 
     log::info!(
         "OnTAD v1.4 (Rust port): maxsz={}, minsz={}, penalty={:.3}, lsize={}, ldiff={}",
@@ -693,18 +717,18 @@ fn run_ontad(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     log::info!("Load {fin}:");
 
     let band = params.maxsz * 2;
-    let cool = open_cooler_file(args, fin)?;
+    let cool = open_cooler_file(common, &fin)?;
     // Banded, mirrored dense matrix for the chromosome (see ontad module).
-    let (mut x, file_meta) = ontad::matrix_from_cooler(&cool, args.chr.as_deref(), band)?;
+    let (mut x, file_meta) = ontad::matrix_from_cooler(&cool, common.chr.as_deref(), band)?;
 
-    if args.log2 {
+    if common.log2 {
         for v in x.iter_mut() {
             *v = (*v + 1.0).log2();
         }
     }
     log::info!(" Done ({:.1?})", t0.elapsed());
 
-    if args.ontad.shuffle {
+    if opts.shuffle {
         log::info!("shuffling matrix");
         let l = x.nrows();
         let mut rng = rand::rng();
@@ -724,11 +748,11 @@ fn run_ontad(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
 
     let tad = ontad::call_tads(&mut x, &params);
 
-    let prefix = args.output.as_deref().unwrap_or(fin);
+    let prefix = common.prefix();
     let fout = format!("{prefix}.tad");
     ontad::write_tad(&fout, &tad)?;
 
-    if args.ontad.bedout {
+    if opts.bedout {
         let foutbed = format!("{prefix}.bed");
         ontad::write_bed(&foutbed, &tad, &file_meta)?;
     }
@@ -740,9 +764,10 @@ fn run_ontad(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     Ok(())
 }
 
-fn run_arrowhead(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
-    let params = args.arrowhead.params();
-    let norm = args.norm.as_deref();
+fn run_arrowhead(common: &CommonArgs, opts: &ArrowheadOptions) -> cooler_rs::Result<()> {
+    let fin = common.fin();
+    let params = opts.params();
+    let norm = common.norm.as_deref();
     log::info!(
         "Arrowhead (Rust port of juicer): window={}, var={:?}, high_sign={}, min_block_size={}, norm={:?}, threads={}",
         params.matrix_width,
@@ -750,25 +775,25 @@ fn run_arrowhead(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
         params.high_sign_threshold,
         params.min_block_size,
         norm,
-        args.threads
+        common.threads
     );
     let t0 = Instant::now();
 
-    let res = resolve_arrowhead_resolution(args, fin)?;
-    let f = File::open(fin, res)?;
-    let chroms: Option<Vec<String>> = args.chr.clone().map(|c| vec![c]);
+    let res = resolve_arrowhead_resolution(common, &fin)?;
+    let f = File::open(&fin, res)?;
+    let chroms: Option<Vec<String>> = common.chr.clone().map(|c| vec![c]);
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(args.threads)
+        .num_threads(common.threads)
         .build()
         .map_err(|e| {
             Error::InvalidInput(format!(
                 "cannot build thread pool with {} threads: {e}",
-                args.threads
+                common.threads
             ))
         })?;
     let domains = pool.install(|| arrowhead::call_domains(&f, norm, &params, chroms.as_deref()))?;
 
-    let prefix = args.output.as_deref().unwrap_or(fin);
+    let prefix = common.prefix();
     let fout = format!("{prefix}.arrowhead.bedpe");
     let mut out = std::fs::File::create(&fout)?;
     for d in &domains {
@@ -794,8 +819,8 @@ fn run_arrowhead(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     Ok(())
 }
 
-fn resolve_arrowhead_resolution(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<u32> {
-    if let Some(r) = args.res {
+fn resolve_arrowhead_resolution(common: &CommonArgs, fin: &str) -> cooler_rs::Result<u32> {
+    if let Some(r) = common.res {
         return Ok(r as u32);
     }
     if fin.ends_with(".hic") {
