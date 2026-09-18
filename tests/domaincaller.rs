@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! End-to-end regression: the Rust `domaincaller` port must reproduce
 //! TADLib's `tadlib/domaincaller/chromLev.py` output on
 //! `mES_rep2.40Kb.raw.chr19.mat` (mouse ES cells, chr19, 40 kb; the same

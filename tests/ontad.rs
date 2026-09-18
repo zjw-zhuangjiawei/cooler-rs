@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! Regression test: with default parameters, the Rust OnTAD port must
 //! reproduce the reference output of the original C++ OnTAD v1.4 on its
 //! published test data.

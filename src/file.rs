@@ -191,8 +191,21 @@ impl File {
                     let w = c
                         .bins_column_f64(name)?
                         .ok_or_else(|| Error::InvalidInput(format!("no 'bins/{name}' column")))?;
+                    // A cooler `bins` column is not necessarily a
+                    // multiplicative bias: `KR`/`VC`/`VC_SQRT`/`SCALE` are
+                    // divisive, and a `divisive_weights` attribute can say so
+                    // for any name. Assuming multiplication balances such a
+                    // column by the reciprocal of the intended factor.
+                    let divisor = c
+                        .bins_column_weight_type(name)?
+                        .is_some_and(|t| t.is_divisive());
                     for p in &mut pixels {
-                        p.count *= w[p.bin1_id as usize] * w[p.bin2_id as usize];
+                        let (a, b) = (p.bin1_id as usize, p.bin2_id as usize);
+                        p.count = if divisor {
+                            p.count / (w[a] * w[b])
+                        } else {
+                            p.count * (w[a] * w[b])
+                        };
                     }
                 }
                 Ok(pixels)

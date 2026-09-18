@@ -649,18 +649,33 @@ fn zlib_compress(data: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| Error::Format(format!("zlib compression failed: {e}")))
 }
 
-/// Default number of bins per block (`blockSize`).
-const DEFAULT_BLOCK_SIZE: i64 = 500;
+/// hictk's `DEFAULT_BLOCK_CAPACITY`: the bin count a block grid is sized
+/// against.
+const BLOCK_CAPACITY: i64 = 1000;
+/// Resolution below which an intra-chromosomal matrix gets a rescaled block
+/// grid (`DEFAULT_INTRA_CUTOFF`).
+const INTRA_CUTOFF: i64 = 500;
+/// Same, for inter-chromosomal matrices and the `All` matrix
+/// (`DEFAULT_INTER_CUTOFF`).
+const INTER_CUTOFF: i64 = 5000;
+/// `sqrt(i32::MAX) - 1`: hictk's clamp on the block column count.
+const MAX_BLOCK_COLUMNS: i64 = 46_340;
 /// Target number of bins for the genome-wide `All` matrix.
 const ALL_TARGET_BINS: u64 = 500;
-/// Scale factor applied to the `All` chromosome length and bin size, keeping
-/// both small enough to store in a v8 `i32` (matching juicer/hictk).
+/// Scale factor applied to the `All` chromosome length and bin size (matching
+/// juicer/hictk).
 const ALL_SCALE_FACTOR: i64 = 1000;
+/// Format version written. v9 is what hictk writes, and it is the only version
+/// juicer's own spec documents in full: 64-bit chromosome lengths and footer
+/// window, an `i64` norm-vector count, `f32` norm-vector values, per-axis
+/// block width flags, and the norm-vector index located through the header
+/// rather than by walking the footer.
+const HIC_VERSION: i32 = 9;
 
-/// Writer for `.hic` (format v8) files.
+/// Writer for `.hic` (format v9) files.
 ///
 /// Accepts pixels per resolution (like [`CoolerWriter::write_pixels`]) and
-/// writes a valid v8 file including the genome-wide `All` pseudo-chromosome.
+/// writes a valid v9 file including the genome-wide `All` pseudo-chromosome.
 /// Pixels are streamed: each [`add_pixel_chunk`] classifies into (c1,c2)
 /// groups and appends to a per-*pair* tempfile under `scratch`. The `All`
 /// matrix is built incrementally during the finest-resolution pass.
@@ -700,7 +715,6 @@ pub struct HicWriter {
     /// `All` matrix parameters, precomputed at create (depend only on chroms + finest).
     final_factor: u64,
     final_bin_size_scaled: i64,
-    final_all_n_bins: i64,
     final_all_length: i32,
 }
 
@@ -718,20 +732,72 @@ type PairPixels = Vec<(i64, i64, f64)>;
 /// One resolution's worth of pixel data for a single chromosome pair.
 struct ResSpec {
     bin_size: i64,
-    /// Number of bins over the first chromosome (drives `blockColumnCount`).
-    n_bins1: i64,
     /// Chromosome-relative `(bin_x, bin_y, count)` records.
     pixels: Vec<(i64, i64, f64)>,
+}
+
+/// The v9 block grid of one matrix at one resolution.
+///
+/// Blocks are **not** square tiles. An inter-chromosomal matrix is a
+/// `num_columns` × `num_columns` grid of `block_bin` × `block_bin` tiles, but
+/// an intra-chromosomal one is split into diagonal bands: a block is the set
+/// of pixels sharing a `(depth, pad)`, where `pad` walks along the diagonal and
+/// `depth` grows logarithmically with the distance from it. That is what makes
+/// the upper triangle cheap to index, and it is why a v8-style
+/// `row * columns + col` numbering cannot be relabelled v9 — the ids would
+/// address blocks that do not exist.
+///
+/// Mirrors `HiCInteractionToBlockMapper`
+/// (`libhictk/hic/impl/interaction_to_block_mapper_impl.hpp:565-650`).
+struct BlockGrid {
+    num_columns: i64,
+    block_bin: i64,
+    intra: bool,
+}
+
+impl BlockGrid {
+    fn new(len1: i64, len2: i64, resolution: i64, cutoff: i64, intra: bool) -> Self {
+        let num_bins = (len1.max(len2) as u64).div_ceil(resolution as u64).max(1) as i64;
+        let mut num_columns = num_bins / BLOCK_CAPACITY + 1;
+        if resolution < cutoff {
+            num_columns = num_bins * resolution / (BLOCK_CAPACITY * cutoff);
+        }
+        let num_columns = num_columns.clamp(1, MAX_BLOCK_COLUMNS);
+        Self {
+            num_columns,
+            block_bin: num_bins / num_columns + 1,
+            intra,
+        }
+    }
+
+    /// The block a chromosome-relative pixel belongs to.
+    fn block_of(&self, bin_x: i64, bin_y: i64) -> i64 {
+        if self.intra {
+            let delta = (bin_x - bin_y).unsigned_abs() as f64;
+            let n = delta / std::f64::consts::SQRT_2 / self.block_bin as f64;
+            let depth = (1.0 + n).ln() / std::f64::consts::LN_2;
+            depth as i64 * self.num_columns + (bin_x + bin_y) / 2 / self.block_bin
+        } else {
+            self.num_columns * (bin_y / self.block_bin) + bin_x / self.block_bin
+        }
+    }
 }
 
 /// Computed metadata for one resolution of a chromosome pair.
 struct ResRecord {
     bin_size: i64,
+    /// Index of this resolution in the header's resolution list.
+    res_idx: i32,
+    /// `blockColumnCount` in the file, i.e. [`BlockGrid::num_columns`].
     block_cols: i64,
+    /// `blockSize` in the file, i.e. [`BlockGrid::block_bin`]. Despite the
+    /// name this is the number of *block rows*, not a bin count per block.
+    block_bin: i64,
     block_count: i32,
     sum_counts: f64,
     nnz: i64,
-    metas: Vec<(i32, i64, i32)>,
+    /// `(block number, file offset, compressed size)` per block.
+    metas: Vec<(i64, i64, i32)>,
 }
 
 impl HicWriter {
@@ -769,7 +835,6 @@ impl HicWriter {
         let total_bins = offsets_f[n_real];
         let all_length = (total_bins * finest as i64 / ALL_SCALE_FACTOR) as i32;
         let bin_size_scaled = (bin_size as i64 / ALL_SCALE_FACTOR).max(1) as i32;
-        let all_n_bins = (total_bins as u64).div_ceil(factor) as i64;
 
         // Pre-create one scratch file per chromosome pair. Scratch is
         // pair-major: a pair's pixels for *every* resolution land in one file,
@@ -800,7 +865,6 @@ impl HicWriter {
             all_map: BTreeMap::new(),
             final_factor: factor,
             final_bin_size_scaled: bin_size_scaled as i64,
-            final_all_n_bins: all_n_bins,
             final_all_length: all_length,
         })
     }
@@ -956,7 +1020,6 @@ impl HicWriter {
 
         let all_length = self.final_all_length;
         let bin_size_scaled = self.final_bin_size_scaled;
-        let all_n_bins = self.final_all_n_bins;
         let all_pixels: Vec<(i64, i64, f64)> = std::mem::take(&mut self.all_map)
             .into_iter()
             .map(|((a, b), c)| (a, b, c))
@@ -965,9 +1028,11 @@ impl HicWriter {
         // Header. `All` is header chromosome 0; real chrom i is header chrom i+1.
         let mut header = Vec::new();
         header.write_all(b"HIC\0")?;
-        header.write_i32::<LittleEndian>(8)?; // version
-        header.write_i64::<LittleEndian>(0)?; // master index position (patched below)
+        header.write_i32::<LittleEndian>(HIC_VERSION)?;
+        header.write_i64::<LittleEndian>(0)?; // footer position (patched below)
         write_cstring(&mut header, &self.genome_id)?;
+        header.write_i64::<LittleEndian>(0)?; // normVectorIndexPosition (patched below)
+        header.write_i64::<LittleEndian>(0)?; // normVectorIndexLength (patched below)
         header.write_i32::<LittleEndian>(self.attributes.len() as i32)?; // nAttributes
         for (k, v) in &self.attributes {
             write_cstring(&mut header, k)?;
@@ -975,10 +1040,10 @@ impl HicWriter {
         }
         header.write_i32::<LittleEndian>((n_real + 1) as i32)?; // nChrs (incl All)
         write_cstring(&mut header, "ALL")?;
-        header.write_i32::<LittleEndian>(all_length)?;
+        header.write_i64::<LittleEndian>(all_length as i64)?;
         for c in &self.chroms {
             write_cstring(&mut header, &c.name)?;
-            header.write_i32::<LittleEndian>(c.length)?;
+            header.write_i64::<LittleEndian>(c.length as i64)?;
         }
         header.write_i32::<LittleEndian>(self.resolutions.len() as i32)?;
         for &r in &self.resolutions {
@@ -1006,7 +1071,6 @@ impl HicWriter {
                     .iter()
                     .map(|&res| ResSpec {
                         bin_size: res as i64,
-                        n_bins1: (self.chroms[c1].length as u64).div_ceil(res as u64) as i64,
                         pixels: by_res.remove(&res).unwrap_or_default(),
                     })
                     .collect();
@@ -1017,7 +1081,6 @@ impl HicWriter {
         }
         let all_spec = ResSpec {
             bin_size: bin_size_scaled,
-            n_bins1: all_n_bins,
             pixels: all_pixels,
         };
         let (pos, size) = self.write_matrix_body(0, 0, std::slice::from_ref(&all_spec))?;
@@ -1031,9 +1094,9 @@ impl HicWriter {
         let mut norm_entries: Vec<(i32, u32, String, i32)> = Vec::new(); // (chrIdx, res, name, size)
         for n in &self.norms {
             let mut b = Vec::new();
-            b.write_i32::<LittleEndian>(n.values.len() as i32)?;
+            b.write_i64::<LittleEndian>(n.values.len() as i64)?;
             for &v in &n.values {
-                b.write_f64::<LittleEndian>(v)?;
+                b.write_f32::<LittleEndian>(v as f32)?;
             }
             let chr_idx = self
                 .chroms
@@ -1050,12 +1113,17 @@ impl HicWriter {
         for (k, _, _) in &footers {
             master_index_size += k.len() as i64 + 1 + 8 + 4;
         }
-        let mut norm_index_size = 4i64; // nNormEntries
+        let mut norm_index_size = 4i64; // nNormVectors
         for (_, _, name, _) in &norm_entries {
-            // name(cstring) + chrIdx(4) + "BP"(cstring 3) + res(4) + pos(8) + size(4)
-            norm_index_size += name.len() as i64 + 1 + 4 + 3 + 4 + 8 + 4;
+            // name(cstring) + chrIdx(4) + "BP"(cstring 3) + res(4) + pos(8) + nBytes(8)
+            norm_index_size += name.len() as i64 + 1 + 4 + 3 + 4 + 8 + 8;
         }
-        let body_start_offset = 4 + master_index_size + 8 + norm_index_size;
+        // Footer layout: nBytesV5(8) + master index + raw EV(4) + norm EV(4).
+        let norm_index_offset = 8 + master_index_size + 8;
+        let body_start_offset = norm_index_offset + norm_index_size;
+        // Where the header's normVectorIndex pair lives, i.e. past
+        // "HIC\0"(4) + version(4) + footerPosition(8) + genomeID\0.
+        let nvi_header_pos = 16 + self.genome_id.len() as u64 + 1;
         let mut body_offset = body_start_offset;
         let mut positions = Vec::with_capacity(norm_entries.len());
         for b in &bodies {
@@ -1068,10 +1136,12 @@ impl HicWriter {
         // vector arrays follow it and are parsed from the live stream. Writing
         // the whole footer length here makes juicer seek past the norm index
         // and hit EOF while parsing it, silently discarding all norm vectors.
-        let footer_v5_size = (master_index_size + 4) as i32; // + raw nExpectedValues int (zero entries)
+        // hictk writes `footer size - 8` here, i.e. the same window minus the
+        // field itself, in an `i64`.
+        let footer_v5_size = master_index_size + 4; // + raw nExpectedValues int (zero entries)
 
         let mut footer = Vec::new();
-        footer.write_i32::<LittleEndian>(footer_v5_size)?; // nBytesV5
+        footer.write_i64::<LittleEndian>(footer_v5_size)?; // nBytesV5
         footer.write_i32::<LittleEndian>(footers.len() as i32)?;
         for (k, pos, size) in &footers {
             write_cstring(&mut footer, k)?;
@@ -1087,16 +1157,22 @@ impl HicWriter {
             write_cstring(&mut footer, "BP")?;
             footer.write_i32::<LittleEndian>(*res as i32)?;
             footer.write_i64::<LittleEndian>(positions[i])?;
-            footer.write_i32::<LittleEndian>(*size)?;
+            footer.write_i64::<LittleEndian>(*size as i64)?;
         }
         self.file.write_all(&footer)?;
         for b in &bodies {
             self.file.write_all(b)?;
         }
 
-        // Patch the master index position in the header.
+        // Patch the header: footer position, and the norm-vector index span
+        // (v9 keeps the index out of the footer and reachable only from here).
+        let nvi_pos = master_pos as i64 + norm_index_offset;
+        let nvi_len = self.file.stream_position()? as i64 - nvi_pos;
         self.file.seek(SeekFrom::Start(8))?;
         self.file.write_i64::<LittleEndian>(master_pos as i64)?;
+        self.file.seek(SeekFrom::Start(nvi_header_pos))?;
+        self.file.write_i64::<LittleEndian>(nvi_pos)?;
+        self.file.write_i64::<LittleEndian>(nvi_len)?;
         self.file.flush()?;
         Ok(())
     }
@@ -1140,16 +1216,29 @@ impl HicWriter {
     /// Write one chromosome pair's matrix record (all resolutions) and its
     /// compressed blocks, returning the record's `(position, size)` for the footer.
     fn write_matrix_body(&mut self, chr1: i32, chr2: i32, specs: &[ResSpec]) -> Result<(i64, i32)> {
+        // `All` is header chromosome 0; real chromosome i is header i+1.
+        let (len1, len2) = if chr1 == 0 {
+            (self.final_all_length as i64, self.final_all_length as i64)
+        } else {
+            (
+                self.chroms[(chr1 - 1) as usize].length as i64,
+                self.chroms[(chr2 - 1) as usize].length as i64,
+            )
+        };
+        let intra = chr1 == chr2;
+        let cutoff = if intra && chr1 != 0 {
+            INTRA_CUTOFF
+        } else {
+            INTER_CUTOFF
+        };
+
         let mut res_records = Vec::with_capacity(specs.len());
-        for spec in specs {
-            let block_cols = (spec.n_bins1 as u64).div_ceil(DEFAULT_BLOCK_SIZE as u64) as i64;
-            let mut blocks: BTreeMap<i32, Vec<(i64, i64, f64)>> = BTreeMap::new();
+        for (res_idx, spec) in specs.iter().enumerate() {
+            let grid = BlockGrid::new(len1, len2, spec.bin_size, cutoff, intra);
+            let mut blocks: BTreeMap<i64, Vec<(i64, i64, f64)>> = BTreeMap::new();
             for &(bin_x, bin_y, count) in &spec.pixels {
-                let block_col = bin_x / DEFAULT_BLOCK_SIZE;
-                let block_row = bin_y / DEFAULT_BLOCK_SIZE;
-                let number = (block_row * block_cols + block_col) as i32;
                 blocks
-                    .entry(number)
+                    .entry(grid.block_of(bin_x, bin_y))
                     .or_default()
                     .push((bin_x, bin_y, count));
             }
@@ -1158,8 +1247,11 @@ impl HicWriter {
             let mut metas = Vec::with_capacity(blocks.len());
             for (number, mut px) in blocks {
                 px.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-                let bin_x_off = (number as i64 % block_cols) * DEFAULT_BLOCK_SIZE;
-                let bin_y_off = (number as i64 / block_cols) * DEFAULT_BLOCK_SIZE;
+                // Block-relative coordinates are measured from the block's
+                // lowest bin, as hictk does. A diagonal-band block has no grid
+                // origin to measure from.
+                let bin_x_off = px.iter().map(|p| p.0).min().unwrap_or(0);
+                let bin_y_off = px.iter().map(|p| p.1).min().unwrap_or(0);
                 let (data, _) = serialize_block(&px, bin_x_off, bin_y_off)?;
                 let compressed = zlib_compress(&data)?;
                 let pos = self.file.stream_position()? as i64;
@@ -1170,7 +1262,9 @@ impl HicWriter {
             }
             res_records.push(ResRecord {
                 bin_size: spec.bin_size,
-                block_cols,
+                res_idx: res_idx as i32,
+                block_cols: grid.num_columns,
+                block_bin: grid.block_bin,
                 block_count: metas.len() as i32,
                 sum_counts,
                 nnz,
@@ -1186,17 +1280,17 @@ impl HicWriter {
         buf.write_i32::<LittleEndian>(res_records.len() as i32)?;
         for rr in &res_records {
             write_cstring(&mut buf, "BP")?;
-            buf.write_i32::<LittleEndian>(0)?; // resIdx
+            buf.write_i32::<LittleEndian>(rr.res_idx)?; // oldIndex
             buf.write_f32::<LittleEndian>(rr.sum_counts as f32)?;
             buf.write_f32::<LittleEndian>(rr.nnz as f32)?; // occupiedCellCount
             buf.write_f32::<LittleEndian>(0.0)?; // stdDev
             buf.write_f32::<LittleEndian>(0.0)?; // percent95
             buf.write_i32::<LittleEndian>(rr.bin_size as i32)?;
-            buf.write_i32::<LittleEndian>(DEFAULT_BLOCK_SIZE as i32)?;
+            buf.write_i32::<LittleEndian>(rr.block_bin as i32)?; // blockSize
             buf.write_i32::<LittleEndian>(rr.block_cols as i32)?;
             buf.write_i32::<LittleEndian>(rr.block_count)?;
             for (number, pos, size) in &rr.metas {
-                buf.write_i32::<LittleEndian>(*number)?;
+                buf.write_i32::<LittleEndian>(*number as i32)?;
                 buf.write_i64::<LittleEndian>(*pos)?;
                 buf.write_i32::<LittleEndian>(*size)?;
             }
@@ -1220,6 +1314,8 @@ fn serialize_block(
     buf.write_i32::<LittleEndian>(bin_x_off as i32)?;
     buf.write_i32::<LittleEndian>(bin_y_off as i32)?;
     buf.write_u8(if use_short { 0 } else { 1 })?;
+    buf.write_u8(0)?; // bin_x width: 0 => 16-bit (v9 per-axis flag)
+    buf.write_u8(0)?; // bin_y width: 0 => 16-bit (v9 per-axis flag)
     buf.write_u8(1)?; // list of rows
 
     // Group pixels (sorted by bin_y then bin_x) into rows.

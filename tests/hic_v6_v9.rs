@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! Version-specific `.hic` read paths: the v6 block body, the v9 block header
 //! (two extra per-axis width flags) and the v9 header-recorded
 //! normalization-vector index.

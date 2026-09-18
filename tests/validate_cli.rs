@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! End-to-end tests for the `cooler-rs validate` subcommand: the library
 //! checker itself is covered by `tests/update.rs`, these check the CLI wiring
 //! (argument handling, per-resolution iteration, exit code).

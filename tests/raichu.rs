@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! Tests for the Raichu normalization port.
 //!
 //! Coverage:

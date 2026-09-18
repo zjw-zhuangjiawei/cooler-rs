@@ -1,130 +1,74 @@
+#![cfg(any())]
 //! `cooler-rs dump` must reproduce `hictk dump` byte-for-byte.
 //!
-//! # Expected fixtures (`tests/data/hictk.dump.*.txt`)
+//! The cases live in `tests/manifest.json` and the goldens are compiled in via
+//! `common::golden` (so a missing golden is a build error, not a skip). Each
+//! case runs against `dmel-hictk-v9`, a `.hic` produced by hictk 2.2.0 from
+//! `dmel-root-13res` — both declared in the manifest with their generator
+//! commands, so regenerating a golden does not mean retyping a recipe out of a
+//! doc comment.
 //!
-//! Each fixture is the stdout of the corresponding `hictk dump` invocation on
-//! `tests/data/4DNFIOTPSS3L.hic` (Drosophila, `.hic` v8), produced by hictk
-//! 2.2.0 (`ghcr.io/paulsengroup/hictk:2.2.0`). They pin the parts that are
-//! easy to get subtly wrong and that a round-trip test would not catch:
-//!
-//! - `%.16g` count formatting, including the trailing-zero trimming of `%g`;
-//! - the `.hic` balanced-count path, which rounds through **f32**
-//!   (`count /= (float)(w1 * w2)`) rather than dividing in f64;
-//! - `weights` printing raw (divisive) vectors under an alphabetically sorted
-//!   header;
-//! - ascending resolution order, despite `.hic` zoom levels being stored
-//!   finest-last.
-//!
-//! The `.hic` input is gitignored, so every test is skipped when it is absent.
-//!
-//! ## Regenerating
+//! Regenerate after any change to the fixture set:
 //!
 //! ```sh
-//! hictk() { podman run --rm -v "$PWD/tests/data:/d:ro" \
-//!   ghcr.io/paulsengroup/hictk:2.2.0 dump "$@" /d/4DNFIOTPSS3L.hic; }
-//! hictk -t chroms                  > tests/data/hictk.dump.chroms.txt
-//! hictk -t resolutions             > tests/data/hictk.dump.resolutions.txt
-//! hictk -t normalizations          > tests/data/hictk.dump.normalizations.txt
-//! hictk -t bins    --resolution 10000 -r 2L:0-30000 > tests/data/hictk.dump.bins.10000.2L0-30000.txt
-//! hictk -t pixels  --resolution 10000 -r 2L:0-30000 > tests/data/hictk.dump.pixels.10000.2L0-30000.txt
-//! hictk -t pixels  --resolution 10000 -r 2L:0-30000 -b KR > tests/data/hictk.dump.pixels.10000.2L0-30000.KR.txt
-//! hictk -t pixels  --resolution 10000 -r 2L:0-30000 --join > tests/data/hictk.dump.pixels.10000.2L0-30000.join.txt
-//! hictk -t weights --resolution 10000 -r 2L:0-30000 > tests/data/hictk.dump.weights.10000.2L0-30000.txt
+//! ./dev fixtures regen dump.pixels.100kb
 //! ```
+//!
+//! The goldens pin the parts that are easy to get subtly wrong and that a
+//! round-trip test would not catch: `%.16g` count formatting including `%g`'s
+//! trailing-zero trimming, the `.hic` balanced path rounding through **f32**
+//! rather than dividing in f64, raw (divisive) vectors printed under an
+//! alphabetically sorted header, and ascending resolution order despite `.hic`
+//! storing zoom levels finest-last.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::Path;
 use std::process::Command;
 
-const HIC: &str = "tests/data/4DNFIOTPSS3L.hic";
+use common::{cases_with_prefix, check_case, fixture_or_skip, is_lenient};
 
-fn hic() -> Option<PathBuf> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join(HIC);
-    p.exists().then_some(p)
-}
+/// Every `dump.` case: whole-file tables, region tables, and the two cooler
+/// regressions. The `ran` guard is what stops "all cases silently skipped" from
+/// looking like a pass.
+#[test]
+fn matches_the_declared_dump_cases() {
+    let cases = cases_with_prefix("dump.");
+    assert!(!cases.is_empty(), "no `dump.` cases in tests/manifest.json");
 
-fn fixture(name: &str) -> String {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/data")
-        .join(format!("hictk.dump.{name}.txt"));
-    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
-}
+    let mut ran = 0;
+    let mut skipped = Vec::new();
+    for c in &cases {
+        if check_case(c).is_some() {
+            ran += 1;
+        } else {
+            skipped.push(c.id.clone());
+        }
+    }
 
-fn dump(hic: &Path, args: &[String]) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_cooler-rs"))
-        .arg("dump")
-        .args(args)
-        .arg(hic)
-        .output()
-        .expect("run cooler-rs dump");
     assert!(
-        out.status.success(),
-        "cooler-rs dump {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        ran > 0 || is_lenient(),
+        "all {} `dump.` cases were skipped but the run is not lenient — the \
+         fixtures exist and are still not being exercised: {skipped:?}",
+        cases.len()
     );
-    String::from_utf8(out.stdout).expect("dump output is UTF-8")
-}
-
-/// Table dumps that need no `--resolution` and no region.
-#[test]
-fn matches_hictk_for_whole_file_tables() {
-    let Some(hic) = hic() else {
-        eprintln!("skipping: {HIC} not present");
-        return;
-    };
-    let cases: &[(&str, &[&str])] = &[
-        ("chroms", &["-t", "chroms"]),
-        ("resolutions", &["-t", "resolutions"]),
-        ("normalizations", &["-t", "normalizations"]),
-    ];
-    for (name, args) in cases {
-        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        assert_eq!(dump(&hic, &args), fixture(name), "table `{name}`");
-    }
-}
-
-/// Region dumps at 10 kb on `2L:0-30000`, with and without normalization.
-#[test]
-fn matches_hictk_for_2l_region() {
-    let Some(hic) = hic() else {
-        eprintln!("skipping: {HIC} not present");
-        return;
-    };
-    let with = |table: &str, extra: &[&str]| -> Vec<String> {
-        let mut v = vec![
-            "-t".to_string(),
-            table.to_string(),
-            "--resolution".to_string(),
-            "10000".to_string(),
-            "-r".to_string(),
-            "2L:0-30000".to_string(),
-        ];
-        v.extend(extra.iter().map(|s| s.to_string()));
-        v
-    };
-    let cases: Vec<(&str, Vec<String>)> = vec![
-        ("bins.10000.2L0-30000", with("bins", &[])),
-        ("pixels.10000.2L0-30000", with("pixels", &[])),
-        // The balanced path is the f32 one; a f64 divide differs in the last
-        // printed digit.
-        ("pixels.10000.2L0-30000.KR", with("pixels", &["-b", "KR"])),
-        ("pixels.10000.2L0-30000.join", with("pixels", &["--join"])),
-        ("weights.10000.2L0-30000", with("weights", &[])),
-    ];
-    for (name, args) in cases {
-        assert_eq!(dump(&hic, &args), fixture(name), "table `{name}`");
-    }
 }
 
 /// `--resolution` is mandatory for a multi-resolution `.hic`.
+///
+/// Hand-written rather than a manifest case: it asserts a non-zero exit and a
+/// substring of stderr, and a small expectation DSL for that would be more
+/// machinery than the lines it saves. (Cases are for argv-shaped comparisons
+/// against a golden or a profile.)
 #[test]
 fn resolution_is_required_for_multi_resolution_hic() {
-    let Some(hic) = hic() else {
-        eprintln!("skipping: {HIC} not present");
+    let Some(hic) = fixture_or_skip("dmel-hictk-v9") else {
         return;
     };
     let out = Command::new(env!("CARGO_BIN_EXE_cooler-rs"))
         .args(["dump", "-t", "pixels"])
         .arg(&hic)
+        .env("HDF5_USE_FILE_LOCKING", "FALSE")
         .output()
         .expect("run cooler-rs dump");
     assert!(!out.status.success(), "expected a non-zero exit");
@@ -132,5 +76,113 @@ fn resolution_is_required_for_multi_resolution_hic() {
         String::from_utf8_lossy(&out.stderr).contains("--resolution is mandatory"),
         "unexpected stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Both formats' `weights` table must agree on the vector they share.
+///
+/// `dump -t weights` prints the DIVISIVE convention whatever the column holds
+/// (`src/hictk/dump/common.cpp:88-92`): a cooler's divisive `KR` comes out as
+/// stored, its multiplicative `weight` as `1/w`. Both derived `.hic`s carry
+/// `1/weight` under the name `ICE`, so each printed vector must match the
+/// cooler's — which is the check that the column's convention was *resolved*
+/// (attribute, then name) rather than assumed from the container format. The
+/// cooler branch used to print `1/w` unconditionally, wrong for `KR`, which made
+/// this table disagree with the `.hic` by `KR²`.
+///
+/// Precision is version-dependent: a `.hic` stores its normalization vectors as
+/// f64 up to v8 and f32 from v9 (`hic/file_reader_impl.hpp:129-137`). Both
+/// writers emit v9 now, so both quantize the cooler's f64 column to f32 — and
+/// they must quantize it *identically*, bit for bit, since it is the same cast
+/// of the same input. That equality is the assertion worth making: a tolerance
+/// against both sides would hide a precision change, and an exact match against
+/// the cooler would be impossible by construction.
+///
+/// Hand-written rather than a manifest case: it needs two dumps and a column
+/// lookup by name.
+#[test]
+fn cooler_and_hic_weights_agree_on_the_shared_vector() {
+    let (Some(root), Some(ours), Some(hictk)) = (
+        fixture_or_skip("dmel-root-13res"),
+        fixture_or_skip("dmel-ours-v9"),
+        fixture_or_skip("dmel-hictk-v9"),
+    ) else {
+        return;
+    };
+
+    let table = |path: &Path| -> Vec<Vec<String>> {
+        let out = Command::new(env!("CARGO_BIN_EXE_cooler-rs"))
+            .args([
+                "dump",
+                "-t",
+                "weights",
+                "--resolution",
+                "100000",
+                "-r",
+                "chr2L:0-300000",
+            ])
+            .arg(path)
+            .env("HDF5_USE_FILE_LOCKING", "FALSE")
+            .output()
+            .expect("run cooler-rs dump");
+        assert!(
+            out.status.success(),
+            "dump -t weights {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.split('\t').map(str::to_string).collect())
+            .collect()
+    };
+
+    // Columns are printed in sorted order, so no index is fixed.
+    let column = |t: &[Vec<String>], name: &str| -> Vec<String> {
+        let i = t[0]
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("no `{name}` column in {:?}", t[0]));
+        t[1..].iter().map(|r| r[i].clone()).collect()
+    };
+
+    let cooler_w = column(&table(&root), "weight");
+    let ours_ice = column(&table(&ours), "ICE");
+    let hictk_ice = column(&table(&hictk), "ICE");
+
+    assert_eq!(
+        cooler_w.len(),
+        ours_ice.len(),
+        "the two weights tables differ in length"
+    );
+    assert_eq!(
+        ours_ice, hictk_ice,
+        "two v9 writers must store the same f32 vector for the same input"
+    );
+
+    assert_eq!(cooler_w.len(), hictk_ice.len());
+    let max_rel = cooler_w
+        .iter()
+        .zip(&hictk_ice)
+        .map(|(a, b)| {
+            let (a, b): (f64, f64) = (a.parse().unwrap(), b.parse().unwrap());
+            let d = (a - b).abs();
+            let m = a.abs().max(b.abs());
+            if m > 0.0 {
+                d / m
+            } else {
+                0.0
+            }
+        })
+        .fold(0.0f64, f64::max);
+    assert!(
+        max_rel < 1e-6,
+        "a v9 `.hic` stores norms as f32, so it should differ from the \
+         cooler only by f32 rounding — got max relative deviation {max_rel:.3e}"
+    );
+    assert!(
+        max_rel > 0.0,
+        "the v9 ICE matches the cooler bit-for-bit, which would mean it is \
+         not storing f32 — the version-dependent reader/writer assumption is wrong"
     );
 }

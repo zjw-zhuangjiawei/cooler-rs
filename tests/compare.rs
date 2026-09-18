@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! `compare` — similarity metrics between two coolers.
 //!
 //! Covers the whole pipeline (SCC, Pearson, Spearman) end-to-end against

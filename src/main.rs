@@ -4,6 +4,7 @@
 //!   `call-tad`  call hierarchical TADs from a .cool/.mcool contact matrix
 //!   `compare`   compare multiple matrices and plot a correlation heatmap
 //!   `convert`   convert other matrix formats to/from cooler format
+//!   `find-tads` call TAD boundaries (HiCExplorer's hicFindTADs)
 //!   `normalize` normalize a contact matrix (ic or raichu)
 //!   `validate`  check a .cool/.mcool file for internal consistency
 //!   `zoomify`   coarsen a single-resolution .cool into a multi-resolution .mcool
@@ -33,6 +34,8 @@ enum Commands {
     Convert(cli::convert::ConvertArgs),
     /// Write tables from a .hic/.cool/.mcool file to stdout
     Dump(cli::dump::DumpArgs),
+    /// Call TAD boundaries with HiCExplorer's hicFindTADs algorithm
+    FindTads(cli::find_tads::FindTadsArgs),
     /// Normalize a contact matrix (iterative correction or Raichu)
     Normalize(cli::normalize::NormalizeArgs),
     /// Check a .cool/.mcool file for internal consistency
@@ -52,6 +55,7 @@ fn main() {
         Commands::Compare(args) => cli::compare::run(args),
         Commands::Convert(args) => cli::convert::run(args),
         Commands::Dump(args) => cli::dump::run(args),
+        Commands::FindTads(args) => cli::find_tads::run(args),
         Commands::Normalize(args) => cli::normalize::run(args),
         Commands::Validate(args) => cli::validate::run(args),
         Commands::Zoomify(args) => cli::zoomify::run(args),

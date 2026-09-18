@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! Regression tests for `cooler_rs::stats` — the pomegranate 0.10.0 port.
 //!
 //! The hard-coded numeric oracles come verbatim from

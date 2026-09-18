@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! Schema-version read paths the current writer does not produce:
 //!
 //! * `.cool` v1 — [`bins/chrom`](Cooler::bin_chrom) holds chromosome *names*

@@ -1,5 +1,8 @@
+#![cfg(any())]
 //! Read-only `.hic` reader tests against `tests/data/4DNFIOTPSS3L.hic`
 //! (Drosophila, v8). Skipped when the file is absent (it is gitignored).
+
+mod common;
 
 use std::path::Path;
 
@@ -157,31 +160,28 @@ fn keeps_pixels_split_across_chunks() {
     std::fs::remove_file(&tmp).ok();
 }
 
-/// v9 fixture (`tests/data/PRJCA014302_At-MNase-allReps-filtered.hic`), also
-/// gitignored. Its v9 block header carries two extra per-axis width flags, so
-/// the v6-v8 parse silently misreads it.
-fn v9_fixture() -> Option<std::path::PathBuf> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/data/PRJCA014302_At-MNase-allReps-filtered.hic");
-    p.exists().then_some(p)
-}
-
+/// v9 fixture: `tests/data/derived.hictk-v9.hic`, written by hictk 2.2.0 from
+/// `dmel-root-13res` (both declared in `tests/manifest.json`). Its v9 block
+/// header carries two extra per-axis width flags, so the v6-v8 parse silently
+/// misreads it. hictk writes only v9 and this crate only v8, so this is the
+/// only real v9 sample available — a hand-built one would only cover the
+/// layouts we already thought of.
 #[test]
 fn reads_a_v9_file() {
-    let Some(path) = v9_fixture() else {
-        eprintln!("skipping: PRJCA014302_At-MNase-allReps-filtered.hic not present");
+    let Some(path) = common::fixture_or_skip("dmel-hictk-v9") else {
         return;
     };
     let hic = HiCFile::open(&path).unwrap();
     assert_eq!(hic.version(), 9);
-    assert_eq!(hic.chromosomes().len(), 5);
+    assert_eq!(hic.chromosomes().len(), 7);
 
-    // Genome-wide pixels at the coarsest resolution (5 Mb), identity-checked
-    // against `hictk dump --resolution 5000000 -t pixels` (row count and sum).
-    let pixels = hic.pixels(5_000_000).unwrap();
-    assert_eq!(pixels.len(), 528);
+    // Genome-wide pixels at the coarsest resolution, identity-checked against
+    // `hictk dump --resolution 100000 -t pixels` (row count and sum) rather
+    // than against whatever this file happens to contain.
+    let pixels = hic.pixels(100_000).unwrap();
+    assert_eq!(pixels.len(), 890_384);
     let sum: f64 = pixels.iter().map(|p| p.count).sum();
-    assert_eq!(sum, 880_614_561.0);
+    assert_eq!(sum, 119_208_613.0);
 }
 
 #[test]

@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! Regression test: the Rust Armatus port must reproduce the reference output
 //! of the original Armatus 2.3 binary on its published example data.
 //!

@@ -94,13 +94,31 @@ struct HicOutputOptions {
     #[arg(long, default_value = "unknown", help_heading = "hic output options")]
     genome_id: String,
 
-    /// Name of a bins column to copy into the .hic footer as normalization
-    /// vectors (e.g. "weight"); resolutions lacking the column are skipped
-    #[arg(long, value_name = "COL", help_heading = "hic output options")]
-    weight: Option<String>,
+    /// Only convert these resolutions (bin sizes); by default every
+    /// resolution of the input is converted. Unlike `-r/--resolution`, which
+    /// is the dense-txt input's bin size, this accepts several values.
+    #[arg(
+        long,
+        value_name = "BP",
+        num_args = 1..,
+        help_heading = "hic output options"
+    )]
+    resolutions: Vec<u32>,
+
+    /// Names of bins columns to copy into the .hic footer as normalization
+    /// vectors (e.g. "weight"); repeat the flag for several. Resolutions
+    /// lacking a column get no vector for it
+    #[arg(
+        long,
+        value_name = "COL",
+        num_args = 1..,
+        help_heading = "hic output options"
+    )]
+    weight: Vec<String>,
 
     /// Store the weight column under this name in the .hic (default: the
-    /// column name); juicer looks up "KR"/"VC", cooler columns are "weight"
+    /// column name); juicer looks up "KR"/"VC", cooler columns are "weight".
+    /// Only valid with a single weight column
     #[arg(long, value_name = "NAME", help_heading = "hic output options")]
     weight_name: Option<String>,
 }
@@ -121,8 +139,9 @@ fn cooler_to_hic(args: &ConvertArgs) -> cooler_rs::Result<()> {
         &args.input,
         &args.output,
         &args.hic.genome_id,
-        args.hic.weight.as_deref(),
+        &args.hic.weight,
         args.hic.weight_name.as_deref(),
+        &args.hic.resolutions,
     )
 }
 

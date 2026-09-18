@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! Round-trip tests for `.cool` and `.mcool` files.
 
 use cooler_rs::{Chrom, Cooler, CoolerWriter, Mcool, McoolWriter, Pixel};

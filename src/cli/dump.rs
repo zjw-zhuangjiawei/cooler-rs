@@ -28,7 +28,7 @@ use cooler_rs::file::File;
 use cooler_rs::hic::HiCFile;
 use cooler_rs::mcool::Mcool;
 use cooler_rs::region::Region;
-use cooler_rs::types::{Bin, Chrom, Pixel};
+use cooler_rs::types::{Bin, Chrom, Pixel, WeightType};
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Table {
@@ -411,9 +411,12 @@ fn dump_weights(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
             }
             (names, columns)
         }
-        // cooler `bins` columns are multiplicative, so hictk prints `1 / w`.
-        // Only the `bins` table is read here — unlike the `.hic` variant,
-        // `File` on a cooler never touches the pixels.
+        // cooler `bins` columns have no inherent convention, so they are
+        // resolved per column and this table is printed in the DIVISIVE one
+        // whatever the column holds (`src/hictk/dump/common.cpp:88-92`): a
+        // multiplicative `weight` comes out as `1/w`, a divisive `KR` as
+        // stored. Only the `bins` table is read here — unlike the `.hic`
+        // variant, `File` on a cooler never touches the pixels.
         _ => {
             let file = File::open(&args.uri, res)?;
             let mut names = file.avail_normalizations()?;
@@ -422,7 +425,11 @@ fn dump_weights(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
             let mut columns = Vec::with_capacity(names.len());
             for n in &names {
                 let w = file_weights(&file, n, bins.len())?;
-                columns.push(w.into_iter().map(|v| 1.0 / v).collect());
+                columns.push(if file_weight_type(&file, n).is_divisive() {
+                    w
+                } else {
+                    w.into_iter().map(|v| 1.0 / v).collect()
+                });
             }
             (names, columns)
         }
@@ -465,6 +472,23 @@ fn file_weights(file: &File, name: &str, n_bins: usize) -> Result<Vec<f64>> {
         .ok_or_else(|| Error::InvalidInput(format!("no '{name}' bins column")))
 }
 
+/// Resolve a weight column's convention on an opened [`File`].
+///
+/// `.hic` normalization vectors are always divisive. A cooler column is
+/// resolved attribute-first, then by name; a column neither decides defaults
+/// to multiplicative, which is what every column did before the type was
+/// resolved at all — so no existing caller changes behavior.
+fn file_weight_type(file: &File, name: &str) -> WeightType {
+    match file {
+        File::Cooler(c) => c
+            .bins_column_weight_type(name)
+            .ok()
+            .flatten()
+            .unwrap_or(WeightType::Multiplicative),
+        File::Hic(_) => WeightType::Divisive,
+    }
+}
+
 fn dump_pixels(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
     let input = open_input(args)?;
     let res = resolve_resolution(args, &input)?;
@@ -478,15 +502,22 @@ fn dump_pixels(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
         Some(r) => bin_ids_for(&chrom_offset, &chroms, res, &r)?,
     };
 
-    // `.hic` and cooler scale through different precisions:
-    // `pixel_selector_impl.hpp:141` divides an f32 by `(float)(w1 * w2)`,
-    // while `weights_impl.hpp:182` divides an f64 by the f64 product.
-    let divisive = matches!(input, Input::Hic(_));
-    let weights = match (args.balance != "NONE").then_some(args.balance.as_str()) {
+    // The *precision* depends on the format — `pixel_selector_impl.hpp:141`
+    // divides an f32 by `(float)(w1 * w2)` for `.hic`, while
+    // `weights_impl.hpp:182` divides an f64 by the f64 product — but the
+    // *operation* depends on the column's resolved type, not the container:
+    // a cooler `KR` column is divisive and its `weight` column is not.
+    let is_hic = matches!(input, Input::Hic(_));
+    let balance = match (args.balance != "NONE").then_some(args.balance.as_str()) {
         None => None,
         Some(name) => Some(match &input {
-            Input::Hic(h) => hic_global_weights(h, res, name)?,
-            _ => file_weights(&File::open(&args.uri, res)?, name, bins.len())?,
+            Input::Hic(h) => (hic_global_weights(h, res, name)?, WeightType::Divisive),
+            _ => {
+                let file = File::open(&args.uri, res)?;
+                let w = file_weights(&file, name, bins.len())?;
+                let t = file_weight_type(&file, name);
+                (w, t)
+            }
         }),
     };
 
@@ -502,11 +533,13 @@ fn dump_pixels(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
     let mut pixels = Vec::new();
     collect_cis(&input, res, i0, i1, &mut pixels)?;
     pixels.sort_unstable_by_key(|p| (p.bin1_id, p.bin2_id));
-    if let Some(w) = &weights {
+    if let Some((w, wtype)) = &balance {
         for p in &mut pixels {
             let (a, b) = (p.bin1_id as usize, p.bin2_id as usize);
-            p.count = if divisive {
+            p.count = if is_hic {
                 scale_divisive_f32(p.count, w[a], w[b])
+            } else if wtype.is_divisive() {
+                p.count / (w[a] * w[b])
             } else {
                 p.count * (w[a] * w[b])
             };

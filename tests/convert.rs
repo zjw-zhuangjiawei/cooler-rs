@@ -1,13 +1,18 @@
+#![cfg(any())]
 //! Integration tests for `cooler_rs::convert::cooler_to_hic` (.cool/.mcool
 //! -> .hic v8 conversion).
 //!
-//! All fixtures are synthetic (no external data): a small multi-resolution
-//! `.mcool` / single-resolution `.cool` is built in place with
+//! Nearly all fixtures are synthetic (no external data): a small
+//! multi-resolution `.mcool` / single-resolution `.cool` is built in place with
 //! `McoolWriter`/`CoolerWriter`, converted, and the output re-read with
-//! `HiCFile` and compared against the source.
+//! `HiCFile` and compared against the source. The one exception is the
+//! bounded-RAM test, which needs a real fine-resolution matrix and so takes
+//! `dmel-root-13res` through the shared harness.
 //!
 //! Chromosomes use non-divisible lengths (`chr1` 250_000, `chr2` 100_000) to
 //! exercise the ceil/partial-bin path at both resolutions.
+
+mod common;
 
 use cooler_rs::{
     convert::cooler_to_hic, write_bins_column, Chrom, Cooler, CoolerWriter, HiCFile, Mcool,
@@ -96,7 +101,7 @@ fn mcool_to_hic_converts_all_resolutions() {
         .unwrap();
     drop(writer);
 
-    cooler_to_hic(&mcool_path, &hic_path, "test", None, None).unwrap();
+    cooler_to_hic(&mcool_path, &hic_path, "test", &[], None, &[]).unwrap();
 
     let hic = HiCFile::open(&hic_path).unwrap();
     assert_eq!(hic.genome_id(), "test");
@@ -137,7 +142,15 @@ fn cool_to_hic_inverts_weight_column() {
     // under an overridden name ("KR") to exercise the renaming path.
     write_bins_column(&cool_path, "/", "weight", &[0.5, 1.0, 2.0, 4.0], &[]).unwrap();
 
-    cooler_to_hic(&cool_path, &hic_path, "test", Some("weight"), Some("KR")).unwrap();
+    cooler_to_hic(
+        &cool_path,
+        &hic_path,
+        "test",
+        &["weight".to_string()],
+        Some("KR"),
+        &[],
+    )
+    .unwrap();
 
     let hic = HiCFile::open(&hic_path).unwrap();
     assert_eq!(hic.chromosomes(), chroms());
@@ -183,7 +196,15 @@ fn mcool_partial_weight_column_is_skipped_when_absent() {
     )
     .unwrap();
 
-    cooler_to_hic(&mcool_path, &hic_path, "test", Some("weight"), None).unwrap();
+    cooler_to_hic(
+        &mcool_path,
+        &hic_path,
+        "test",
+        &["weight".to_string()],
+        None,
+        &[],
+    )
+    .unwrap();
 
     let hic = HiCFile::open(&hic_path).unwrap();
     assert_eq!(
@@ -200,51 +221,59 @@ fn mcool_partial_weight_column_is_skipped_when_absent() {
     assert_eq!(hic.norm_vector(50_000, "chr1", "weight").unwrap(), None);
 }
 
-/// Resolve the optional large-fixture .mcool used for the bounded-RAM test.
-/// Skips (no-op) when the fixture is absent, matching the discipline in
-/// `tests/hic.rs` (`fixture()`).
-fn fixture_mcool() -> Option<std::path::PathBuf> {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/4DNFIZ1ZVXC8.mcool");
-    p.exists().then_some(p)
-}
-
-#[cfg(unix)]
-fn resident_bytes() -> u64 {
-    // /proc/self/statm: size | resident | shared | text | data | dirty
-    let s = std::fs::read_to_string("/proc/self/statm").unwrap();
-    let mut it = s.split_whitespace();
-    let _size: u64 = it.next().unwrap().parse().unwrap();
-    let resident_pages: u64 = it.next().unwrap().parse().unwrap();
-    resident_pages * 4096
-}
-
-#[cfg(not(unix))]
-fn resident_bytes() -> u64 {
-    0
+/// Peak resident set size of this process, in MB, from `/proc/self/status`.
+///
+/// `VmHWM` is a high-water mark, so it catches a transient allocation that a
+/// pair of spot samples misses — the shape of the 36 GB `finalize` blowup this
+/// test exists to catch. It is monotonic for the life of the process, so the
+/// assertion below is an absolute ceiling, not a before/after delta.
+#[cfg(target_os = "linux")]
+fn peak_rss_mb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb: u64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(kb / 1024)
 }
 
 #[test]
 fn convert_large_mcool_stays_bounded() {
-    let Some(input) = fixture_mcool() else {
-        eprintln!("skipping: 4DNFIZ1ZVXC8.mcool not present");
+    let Some(input) = common::fixture_or_skip("dmel-root-13res") else {
         return;
     };
+    if !cfg!(target_os = "linux") {
+        eprintln!("SKIP convert_large_mcool_stays_bounded (no VmHWM outside Linux)");
+        return;
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out.hic");
 
-    let peak_before = resident_bytes();
-    cooler_to_hic(&input, &out, "test", None, None).unwrap();
-    let peak_after = resident_bytes();
-    let delta_mb = peak_after.saturating_sub(peak_before) / 1_000_000;
+    // Two resolutions, not all thirteen: 1 kb is where the per-pair scratch and
+    // the 1M-pixel chunk boundary are both exercised, and 100 kb keeps a coarse
+    // level in the file. Measured on this machine: ~19 s and ~540 MB peak.
+    // Converting every resolution takes minutes and covers no path this one
+    // does not.
+    cooler_to_hic(&input, &out, "test", &[], None, &[1000, 100_000]).unwrap();
 
+    let peak = peak_rss_mb().expect("checked by cfg! above");
     assert!(
-        delta_mb < 512,
-        "peak RSS grew by {delta_mb} MB during conversion; budget is 512 MB"
+        peak < 1536,
+        "peak RSS reached {peak} MB during conversion; budget is 1536 MB. \
+         The failure this guards against was a 36 GB allocation, which a \
+         before/after sample of /proc/self/statm could not see."
     );
 
     let hic = HiCFile::open(&out).unwrap();
-    assert!(!hic.resolutions().is_empty());
-    let coarse = *hic.resolutions().iter().min().unwrap();
-    let pixels = hic.pixels(coarse).unwrap();
-    assert!(!pixels.is_empty(), "no pixels at coarsest resolution");
+    // `resolutions()` returns the stored order, which is finest-last, so sort
+    // before comparing — `dump` is what presents them ascending.
+    let mut got = hic.resolutions().to_vec();
+    got.sort_unstable();
+    assert_eq!(got, vec![1000, 100_000]);
+    let pixels = hic.pixels(100_000).unwrap();
+    assert!(!pixels.is_empty(), "no pixels at 100 kb");
 }

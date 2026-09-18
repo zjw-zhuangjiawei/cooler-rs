@@ -36,6 +36,14 @@ plus the `cooler-rs` command-line tool for Hi-C analysis.
   - `cooler-rs dump` — write tables out of a `.hic`/`.cool`/`.mcool` file to
     stdout (`chroms`, `bins`, `pixels`, `resolutions`, `normalizations`,
     `weights`), a port of `hictk dump` that reproduces its output byte-for-byte.
+  - `cooler-rs find-tads` — TAD boundary calling with HiCExplorer's
+    `hicFindTADs` algorithm: z-scores the matrix per chromosome, scores every
+    bin with the mean z-score of the contacts crossing it over a range of
+    window sizes (the TAD-separation score), and calls a boundary at each
+    local minimum that clears the delta and significance filters. Writes
+    `_tad_score.bm`, `_zscore_matrix.cool`, `_boundaries.bed`,
+    `_boundaries.gff`, `_domains.bed` and `_score.bedgraph`; FDR, Bonferroni
+    and uncorrected p-values are all available.
   - `cooler-rs validate` — check a `.cool`/`.mcool` file for internal
     consistency (schema + index invariants: offsets, bin/chrom codes, pixel
     ordering and ranges). Checks every resolution of a `.mcool`; prints each
@@ -104,6 +112,10 @@ cargo run --release -- normalize /tmp/toy.cool --method raichu
 
 # Compare two matrices and write a correlation heatmap (default: all metrics)
 cargo run --release -- compare /tmp/toy.cool /tmp/toy2.cool --metric scc --metric pearson -o heatmap
+
+# Call TAD boundaries (hicFindTADs port; weights come from a bins column)
+cargo run --release -- find-tads /tmp/toy.cool --norm weight \
+    --min-depth 60000 --max-depth 180000 --step 20000 -o TADs
 ```
 
 Run `cooler-rs <COMMAND> --help` for the full option list of each subcommand.
@@ -131,6 +143,7 @@ link statically without a system HDF5.
 | `ontad`           | OnTAD hierarchical TAD algorithm    |
 | `domaincaller`    | TADLib DomainCaller port (Dixon et al., 2012) |
 | `armatus`         | Armatus 2.3 multiresolution TAD port (Filippova et al., 2014) |
+| `findtads`        | hicFindTADs TAD-separation score and boundary caller |
 | `balance`         | iterative-correction matrix balancing (port of `cooler balance`) |
 | `zoomify`         | coarsen a `.cool` into a multi-resolution `.mcool` (port of `cooler zoomify`) |
 | `raichu`          | Raichu sliding-window normalization (port of RaichuNorm) |

@@ -1,3 +1,0 @@
-KR
-VC
-VC_SQRT

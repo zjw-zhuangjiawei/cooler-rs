@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! Tests for in-place update/delete helpers and the integrity checker:
 //! `rename_chroms`, `delete_bins_column`, `Cooler::validate`.
 

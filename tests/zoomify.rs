@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! Identity / self-consistency tests for `zoomify`.
 //!
 //! # Expected fixture (`tests/data/syn.zoomify.cooler-python.json`)

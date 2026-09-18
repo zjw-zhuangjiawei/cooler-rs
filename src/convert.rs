@@ -104,10 +104,20 @@ pub fn cooler_to_hic<P: AsRef<Path>, Q: AsRef<Path>>(
     input: P,
     output: Q,
     genome_id: &str,
-    weight_col: Option<&str>,
+    weight_cols: &[String],
     weight_name: Option<&str>,
+    resolutions: &[u32],
 ) -> Result<()> {
     let input = input.as_ref();
+
+    // One name cannot label several vectors, and defaulting it to the first
+    // column would silently mislabel the rest.
+    if weight_name.is_some() && weight_cols.len() > 1 {
+        return Err(Error::InvalidInput(
+            "--weight-name names a single vector; with several weight columns each keeps its own column name"
+                .into(),
+        ));
+    }
 
     // Phase 1: discover resolutions + chroms without holding every Cooler.
     let (resolutions_u64, chroms) = if let Ok(mcool) = Mcool::open(input) {
@@ -137,6 +147,34 @@ pub fn cooler_to_hic<P: AsRef<Path>, Q: AsRef<Path>>(
         (vec![res as u64], cool.chroms()?)
     };
 
+    // An empty `resolutions` is "all of them". A requested resolution the
+    // input does not have is an error rather than a silent omission — the
+    // caller asked for a specific output and getting fewer resolutions than
+    // named would only show up later, in the .hic's resolution list.
+    let resolutions_u64 = if resolutions.is_empty() {
+        resolutions_u64
+    } else {
+        let mut want: Vec<u64> = resolutions.iter().map(|&r| r as u64).collect();
+        want.sort_unstable();
+        want.dedup();
+        for r in &want {
+            if !resolutions_u64.contains(r) {
+                return Err(Error::InvalidInput(format!(
+                    "resolution {r} is not present in '{}' (has {resolutions_u64:?})",
+                    input.display()
+                )));
+            }
+        }
+        if want.len() < resolutions_u64.len() {
+            log::info!(
+                "converting {} of {} resolutions: {want:?}",
+                want.len(),
+                resolutions_u64.len()
+            );
+        }
+        want
+    };
+
     // The `All` pseudo-chromosome is reserved by the writer (and filtered by
     // the reader); a real `All` chromosome would be silently dropped.
     for c in &chroms {
@@ -149,7 +187,7 @@ pub fn cooler_to_hic<P: AsRef<Path>, Q: AsRef<Path>>(
 
     // Phase 2: validate per-res by reopening one Cooler at a time.
     let mut res_u32 = Vec::with_capacity(resolutions_u64.len());
-    let mut weight_seen = false;
+    let mut weight_seen = vec![false; weight_cols.len()];
     for &r in &resolutions_u64 {
         let cool = open_res(input, r)?;
         if cool.chroms()? != chroms {
@@ -159,14 +197,14 @@ pub fn cooler_to_hic<P: AsRef<Path>, Q: AsRef<Path>>(
         }
         let res32 = resolution_u32(r)?;
         check_uniform_bins(&cool, &chroms, res32)?;
-        if let Some(col) = weight_col {
-            weight_seen |= cool.bins_has_column(col)?;
+        for (i, col) in weight_cols.iter().enumerate() {
+            weight_seen[i] |= cool.bins_has_column(col)?;
         }
         res_u32.push(res32);
         drop(cool);
     }
-    if let Some(col) = weight_col {
-        if !weight_seen {
+    for (col, seen) in weight_cols.iter().zip(&weight_seen) {
+        if !*seen {
             return Err(Error::InvalidInput(format!(
                 "bins column '{col}' not found in the input"
             )));
@@ -186,9 +224,13 @@ pub fn cooler_to_hic<P: AsRef<Path>, Q: AsRef<Path>>(
             writer.add_pixel_chunk(res, &chunk)?;
         }
         writer.finish_resolution(res)?;
-        if let Some(col) = weight_col {
-            let name = weight_name.unwrap_or(col);
+        for col in weight_cols {
             if cool.bins_has_column(col)? {
+                let name = if weight_cols.len() == 1 {
+                    weight_name.unwrap_or(col.as_str())
+                } else {
+                    col.as_str()
+                };
                 let mut vectors = split_bins_column(&cool, &chroms, col)?;
                 // cooler weights multiply, `.hic` normalization vectors divide.
                 for (_, values) in &mut vectors {

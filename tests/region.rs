@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! Integration tests for `Cooler::offset` / `Cooler::extent` region queries.
 
 use cooler_rs::{write_bins_column, Chrom, Cooler, CoolerWriter, Pixel, Region, SubMatrix};

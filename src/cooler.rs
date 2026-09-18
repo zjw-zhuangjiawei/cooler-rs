@@ -15,7 +15,7 @@ use sprs::TriMat;
 
 use crate::error::{Error, Result};
 use crate::region::Region;
-use crate::types::{Bin, Chrom, Pixel};
+use crate::types::{Bin, Chrom, Pixel, WeightType};
 
 /// Value of the `format` attribute for single-resolution files.
 pub const COOL_FORMAT: &str = "HDF5::Cooler";
@@ -337,11 +337,69 @@ impl CoolerWriter {
         Self::from_group(group, chroms, bin_size)
     }
 
+    /// Create a `.cool` file whose bin table is given explicitly, so the bins
+    /// need not be a uniform tiling (e.g. after masked bins are dropped and
+    /// the gaps redistributed). `bins` must be sorted by chromosome, then
+    /// start, and every `chrom_id` must index `chroms`.
+    pub fn create_with_bins<P: AsRef<Path>>(
+        path: P,
+        chroms: &[Chrom],
+        bins: &[Bin],
+    ) -> Result<Self> {
+        let file = File::create(path)?;
+        let group = file.group("/")?;
+        Self::from_group_with_bins(group, chroms, bins)
+    }
+
+    /// Write a cooler collection with an explicit bin table into an existing
+    /// HDF5 group.
+    pub fn from_group_with_bins(group: Group, chroms: &[Chrom], bins: &[Bin]) -> Result<Self> {
+        let bin_chrom: Vec<i32> = bins.iter().map(|b| b.chrom_id).collect();
+        let bin_start: Vec<i32> = bins.iter().map(|b| b.start).collect();
+        let bin_end: Vec<i32> = bins.iter().map(|b| b.end).collect();
+        Self::write_group(group, chroms, None, &bin_chrom, &bin_start, &bin_end)
+    }
+
     /// Write a cooler collection into an existing HDF5 group.
     pub fn from_group(group: Group, chroms: &[Chrom], bin_size: u32) -> Result<Self> {
         if bin_size == 0 {
             return Err(Error::InvalidInput("bin_size must be positive".into()));
         }
+
+        // /bins table, generated for fixed-size bins.
+        let mut bin_chrom: Vec<i32> = Vec::new();
+        let mut bin_start: Vec<i32> = Vec::new();
+        let mut bin_end: Vec<i32> = Vec::new();
+        for (chrom_id, chrom) in chroms.iter().enumerate() {
+            let n =
+                ((i64::from(chrom.length) + i64::from(bin_size) - 1) / i64::from(bin_size)) as i32;
+            for i in 0..n {
+                let start = i * bin_size as i32;
+                bin_chrom.push(chrom_id as i32);
+                bin_start.push(start);
+                bin_end.push((start + bin_size as i32).min(chrom.length));
+            }
+        }
+        Self::write_group(
+            group,
+            chroms,
+            Some(bin_size),
+            &bin_chrom,
+            &bin_start,
+            &bin_end,
+        )
+    }
+
+    /// Shared body of the two constructors: validate, then write the
+    /// attributes, `/chroms`, `/bins` and `/indexes/chrom_offset`.
+    fn write_group(
+        group: Group,
+        chroms: &[Chrom],
+        bin_size: Option<u32>,
+        bin_chrom: &[i32],
+        bin_start: &[i32],
+        bin_end: &[i32],
+    ) -> Result<Self> {
         for chrom in chroms {
             if chrom.length < 0 {
                 return Err(Error::InvalidInput(format!(
@@ -350,12 +408,27 @@ impl CoolerWriter {
                 )));
             }
         }
+        if let Some(bin_size) = bin_size {
+            if bin_size == 0 {
+                return Err(Error::InvalidInput("bin_size must be positive".into()));
+            }
+        }
+        if bin_chrom.len() != bin_start.len() || bin_chrom.len() != bin_end.len() {
+            return Err(Error::InvalidInput(
+                "bin table columns have different lengths".into(),
+            ));
+        }
 
         // Required attributes (schema v3).
         write_attr_str(&group, "format", COOL_FORMAT)?;
         write_attr_int(&group, "format-version", COOL_FORMAT_VERSION)?;
-        write_attr_str(&group, "bin-type", "fixed")?;
-        write_attr_int(&group, "bin-size", i64::from(bin_size))?;
+        match bin_size {
+            Some(bin_size) => {
+                write_attr_str(&group, "bin-type", "fixed")?;
+                write_attr_int(&group, "bin-size", i64::from(bin_size))?;
+            }
+            None => write_attr_str(&group, "bin-type", "variable")?,
+        }
         write_attr_str(&group, "storage-mode", STORAGE_MODE)?;
 
         // /chroms table.
@@ -371,22 +444,12 @@ impl CoolerWriter {
             .create("length")?
             .write(&chroms.iter().map(|c| c.length).collect::<Vec<_>>())?;
 
-        // /bins table, generated for fixed-size bins.
-        let mut bin_chrom: Vec<i32> = Vec::new();
-        let mut bin_start: Vec<i32> = Vec::new();
-        let mut bin_end: Vec<i32> = Vec::new();
+        // /indexes/chrom_offset, from the runs in the (chrom-sorted) bin table.
         let mut chrom_offset: Vec<i64> = Vec::with_capacity(chroms.len() + 1);
         chrom_offset.push(0);
-        for (chrom_id, chrom) in chroms.iter().enumerate() {
-            let n =
-                ((i64::from(chrom.length) + i64::from(bin_size) - 1) / i64::from(bin_size)) as i32;
-            for i in 0..n {
-                let start = i * bin_size as i32;
-                bin_chrom.push(chrom_id as i32);
-                bin_start.push(start);
-                bin_end.push((start + bin_size as i32).min(chrom.length));
-            }
-            chrom_offset.push(chrom_offset.last().unwrap() + i64::from(n));
+        for chrom_id in 0..chroms.len() as i32 {
+            let n = bin_chrom.iter().filter(|&&c| c == chrom_id).count() as i64;
+            chrom_offset.push(chrom_offset.last().unwrap() + n);
         }
         let n_bins = bin_chrom.len() as u64;
 
@@ -395,17 +458,17 @@ impl CoolerWriter {
             .new_dataset::<i32>()
             .shape(bin_chrom.len())
             .create("chrom")?
-            .write(&bin_chrom)?;
+            .write(bin_chrom)?;
         bin_group
             .new_dataset::<i32>()
             .shape(bin_start.len())
             .create("start")?
-            .write(&bin_start)?;
+            .write(bin_start)?;
         bin_group
             .new_dataset::<i32>()
             .shape(bin_end.len())
             .create("end")?
-            .write(&bin_end)?;
+            .write(bin_end)?;
 
         // /indexes/chrom_offset.
         let index_group = group.create_group("indexes")?;
@@ -615,38 +678,26 @@ impl Cooler {
             }
         };
 
-        // Match on common fixed-string lengths (1-64 covers all chromosome names).
+        // A wider memory type than the dataset's works: HDF5 pads the shorter
+        // strings and `FixedAscii` trims the trailing NULs. Cooler sizes the
+        // dataset to the longest chromosome name, so the width is whatever
+        // the data needed rather than a value from a fixed set.
         macro_rules! read_fixed {
-            ($n:expr) => {{
-                use hdf5_metno::types::FixedAscii;
-                let values: Vec<FixedAscii<$n>> = ds.read_1d()?.to_vec();
-                values.iter().map(|v| v.to_string()).collect::<Vec<_>>()
-            }};
+            ($n:literal) => {
+                if let Ok(values) = ds.read_1d::<hdf5_metno::types::FixedAscii<$n>>() {
+                    return Ok(values.iter().map(|v| v.to_string()).collect());
+                }
+            };
         }
 
-        Ok(match len {
-            1 => read_fixed!(1),
-            2 => read_fixed!(2),
-            3 => read_fixed!(3),
-            4 => read_fixed!(4),
-            5 => read_fixed!(5),
-            6 => read_fixed!(6),
-            7 => read_fixed!(7),
-            8 => read_fixed!(8),
-            10 => read_fixed!(10),
-            12 => read_fixed!(12),
-            16 => read_fixed!(16),
-            24 => read_fixed!(24),
-            32 => read_fixed!(32),
-            64 => read_fixed!(64),
-            128 => read_fixed!(128),
-            256 => read_fixed!(256),
-            n => {
-                return Err(Error::Format(format!(
-                    "unsupported fixed-string length {n} in dataset '{path}'"
-                )));
-            }
-        })
+        read_fixed!(256);
+        read_fixed!(128);
+        read_fixed!(64);
+        read_fixed!(32);
+
+        Err(Error::Format(format!(
+            "unsupported fixed-string length {len} in dataset '{path}'"
+        )))
     }
 
     /// The fixed bin size, if declared in the attributes.
@@ -834,14 +885,36 @@ impl Cooler {
 
     /// List all column names in the bins table.
     pub fn bins_column_names(&self) -> Result<Vec<String>> {
-        let all = self.group.member_names()?;
-        Ok(all
+        // `Group::member_names` is non-recursive and yields bare names
+        // (`["bins", "chroms", "pixels"]` for a resolution group), so the
+        // columns are the `bins` group's own members. Filtering *this*
+        // group's names for a `bins/` prefix, as this once did, matched
+        // nothing and made every caller see an empty column list.
+        let bins = self.group.group("bins")?;
+        Ok(bins
+            .member_names()?
             .into_iter()
-            .filter(|n| {
-                n.starts_with("bins/") && n != "bins/chrom" && n != "bins/start" && n != "bins/end"
-            })
-            .map(|n| n.strip_prefix("bins/").unwrap().to_string())
+            .filter(|n| n != "chrom" && n != "start" && n != "end")
             .collect())
+    }
+
+    /// How a `bins` column is applied: the `divisive_weights` attribute when
+    /// the column carries one, otherwise the column name. `None` when neither
+    /// decides, which is not the same as multiplicative.
+    pub fn bins_column_weight_type(&self, name: &str) -> Result<Option<WeightType>> {
+        let path = format!("bins/{}", name);
+        if !self.group.link_exists(&path) {
+            return Ok(None);
+        }
+        let ds = self.group.dataset(&path)?;
+        // hictk writes this attribute as an HDF5 bool; this crate's
+        // `normalize` writes it as an int (`AttrValue::I64`), so accept both.
+        let divisive = ds.attr("divisive_weights").ok().and_then(|a| {
+            a.read_scalar::<bool>()
+                .ok()
+                .or_else(|| a.read_scalar::<i64>().ok().map(|v| v != 0))
+        });
+        Ok(WeightType::resolve(name, divisive))
     }
 
     /// Read a float64 column from the bins table by name.

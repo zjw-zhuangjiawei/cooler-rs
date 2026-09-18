@@ -45,6 +45,7 @@ pub mod cooler;
 pub mod domaincaller;
 pub mod error;
 pub mod file;
+pub mod findtads;
 pub mod hic;
 pub mod mcool;
 pub mod ontad;

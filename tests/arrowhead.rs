@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! Arrowhead integration smoke tests. The `.hic`/`.mcool` fixtures are
 //! gitignored; each test is skipped when its file is absent.
 

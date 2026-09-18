@@ -92,6 +92,69 @@ impl Weights {
     }
 }
 
+/// How a stored weight vector relates to the balanced count.
+///
+/// A cooler `bins` column carries no inherent convention: the same file can
+/// hold a multiplicative `weight` column and a divisive `KR` column side by
+/// side, so the convention has to be *resolved* rather than assumed from the
+/// container format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightType {
+    /// `balanced = count * w1 * w2`. cooler's `weight`/`ICE` columns.
+    Multiplicative,
+    /// `balanced = count / (w1 * w2)`. Every `.hic` normalization vector, and
+    /// cooler columns named `KR`/`VC`/`VC_SQRT`/`SCALE`.
+    Divisive,
+}
+
+impl WeightType {
+    /// Resolve from the column name alone, mirroring hictk's
+    /// `balancing::Weights::infer_type`
+    /// (`balancing/impl/weights_impl.hpp:230-244`, 14 names). `None` means
+    /// unrecognized — hictk rejects such a column rather than guessing.
+    pub fn infer(name: &str) -> Option<Self> {
+        // juicer's vectors: divisive, i.e. applied by division.
+        const DIVISIVE: [&str; 10] = [
+            "VC",
+            "INTER_VC",
+            "GW_VC",
+            "VC_SQRT",
+            "KR",
+            "INTER_KR",
+            "GW_KR",
+            "SCALE",
+            "INTER_SCALE",
+            "GW_SCALE",
+        ];
+        // cooler's own balancing output: multiplicative biases.
+        const MULTIPLICATIVE: [&str; 4] = ["ICE", "INTER_ICE", "GW_ICE", "weight"];
+
+        if DIVISIVE.contains(&name) {
+            Some(Self::Divisive)
+        } else if MULTIPLICATIVE.contains(&name) {
+            Some(Self::Multiplicative)
+        } else {
+            None
+        }
+    }
+
+    /// Resolve the way hictk does: an explicit `divisive_weights` attribute
+    /// wins, otherwise the column name decides
+    /// (`cooler/impl/file_read_impl.hpp:329-341`). `None` means undecided.
+    pub fn resolve(name: &str, divisive_attr: Option<bool>) -> Option<Self> {
+        match divisive_attr {
+            Some(true) => Some(Self::Divisive),
+            Some(false) => Some(Self::Multiplicative),
+            None => Self::infer(name),
+        }
+    }
+
+    /// True when the vector is applied by division.
+    pub fn is_divisive(self) -> bool {
+        self == Self::Divisive
+    }
+}
+
 /// Common pixel + index read surface consumed by the iterative-correction
 /// core. Implemented by [`crate::Cooler`] and [`crate::File`] so balancing
 /// works on both `.cool` and `.hic` inputs.
