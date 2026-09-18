@@ -123,6 +123,21 @@ fn chromosome_subset_matches_hicexplorer() {
     );
 }
 
+/// The flag surface has to survive clap's own consistency check: two option
+/// groups sharing an argument id panic at runtime rather than at build time,
+/// and only a real parse catches it.
+#[test]
+fn call_tad_flags_parse() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cooler-rs"))
+        .args(["call-tad", "--help"])
+        .output()
+        .expect("run cooler-rs");
+    assert!(out.status.success(), "call-tad --help failed");
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("hicexplorer"), "missing method: {help}");
+    assert!(help.contains("--window-step"), "missing flag: {help}");
+}
+
 /// The window sizes are the step function the whole scoring stage is built
 /// on; the values are the ones the `--step 20000 --minDepth 60000
 /// --maxDepth 180000` invocation logs.

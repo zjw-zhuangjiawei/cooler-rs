@@ -10,10 +10,18 @@ plus the `cooler-rs` command-line tool for Hi-C analysis.
   `.cool` and multi-resolution `.mcool` files following the cooler schema
   (bin table, sparse pixel matrix, chromosome offsets).
 - **CLI**: a single `cooler-rs` binary:
-  - `cooler-rs call-tad` — hierarchical TAD calling (`--method ontad`, a port of
+  - `cooler-rs call-tad` — TAD calling (`--method ontad`, a port of
     [OnTAD v1.4](https://github.com/anlin00007/OnTAD); `--method domaincaller`,
     a TADLib port; `--method armatus`, an
-    [Armatus 2.3](https://github.com/kingsfordgroup/armatus) port).
+    [Armatus 2.3](https://github.com/kingsfordgroup/armatus) port;
+    `--method hicexplorer`, HiCExplorer's `hicFindTADs`: z-scores the matrix
+    per chromosome, scores every bin with the mean z-score of the contacts
+    crossing it over a range of window sizes (the TAD-separation score), and
+    calls a boundary at each local minimum that clears the delta and
+    significance filters. Writes `_tad_score.bm`, `_zscore_matrix.cool`,
+    `_boundaries.bed`, `_boundaries.gff`, `_domains.bed` and
+    `_score.bedgraph`; runs genome-wide, and takes `--chromosomes` for a
+    subset).
   - `cooler-rs convert` — format conversion (e.g. `--from dense-txt`, a dense
     N×N text matrix to `.cool`).
   - `cooler-rs zoomify` — coarsen a single-resolution `.cool` into a
@@ -36,14 +44,6 @@ plus the `cooler-rs` command-line tool for Hi-C analysis.
   - `cooler-rs dump` — write tables out of a `.hic`/`.cool`/`.mcool` file to
     stdout (`chroms`, `bins`, `pixels`, `resolutions`, `normalizations`,
     `weights`), a port of `hictk dump` that reproduces its output byte-for-byte.
-  - `cooler-rs find-tads` — TAD boundary calling with HiCExplorer's
-    `hicFindTADs` algorithm: z-scores the matrix per chromosome, scores every
-    bin with the mean z-score of the contacts crossing it over a range of
-    window sizes (the TAD-separation score), and calls a boundary at each
-    local minimum that clears the delta and significance filters. Writes
-    `_tad_score.bm`, `_zscore_matrix.cool`, `_boundaries.bed`,
-    `_boundaries.gff`, `_domains.bed` and `_score.bedgraph`; FDR, Bonferroni
-    and uncorrected p-values are all available.
   - `cooler-rs validate` — check a `.cool`/`.mcool` file for internal
     consistency (schema + index invariants: offsets, bin/chrom codes, pixel
     ordering and ranges). Checks every resolution of a `.mcool`; prints each
@@ -113,9 +113,9 @@ cargo run --release -- normalize /tmp/toy.cool --method raichu
 # Compare two matrices and write a correlation heatmap (default: all metrics)
 cargo run --release -- compare /tmp/toy.cool /tmp/toy2.cool --metric scc --metric pearson -o heatmap
 
-# Call TAD boundaries (hicFindTADs port; weights come from a bins column)
-cargo run --release -- find-tads /tmp/toy.cool --norm weight \
-    --min-depth 60000 --max-depth 180000 --step 20000 -o TADs
+# hicFindTADs TAD boundaries, genome-wide (weights come from a bins column)
+cargo run --release -- call-tad /tmp/toy.cool --method hicexplorer --norm weight \
+    --min-depth 60000 --max-depth 180000 --window-step 20000 -o TADs
 ```
 
 Run `cooler-rs <COMMAND> --help` for the full option list of each subcommand.

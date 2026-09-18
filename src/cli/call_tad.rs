@@ -16,6 +16,7 @@ use rand::Rng;
 use cooler_rs::armatus;
 use cooler_rs::arrowhead;
 use cooler_rs::domaincaller::Chrom;
+use cooler_rs::findtads::{self, MultipleTesting};
 use cooler_rs::ontad::{self, Params};
 use cooler_rs::{ChromMeta, Cooler, Error, File, Mcool};
 
@@ -30,6 +31,20 @@ pub enum TadMethod {
     Armatus,
     /// Arrowhead (Huntley & Durand, Cell Syst 2016; Rust port of juicer)
     Arrowhead,
+    /// hicFindTADs (HiCExplorer): TAD-separation score and boundary caller
+    Hicexplorer,
+}
+
+/// Multiple-testing correction for the hicFindTADs boundary p-values.
+#[derive(Clone, Copy, ValueEnum)]
+enum Correction {
+    /// Benjamini-Hochberg false discovery rate (q-value).
+    Fdr,
+    /// Bonferroni family-wise error rate (p-value).
+    Bonferroni,
+    /// Raw p-values, no correction.
+    #[value(alias = "None")]
+    None,
 }
 
 #[derive(Args)]
@@ -64,6 +79,11 @@ pub struct CallTadArgs {
     #[arg(long = "log2")]
     log2: bool,
 
+    /// Normalization to apply (a `bins` column for a `.cool`/`.mcool`, a
+    /// normalization type for a `.hic`; `NONE` means raw counts)
+    #[arg(long, value_name = "NAME")]
+    norm: Option<String>,
+
     #[command(flatten)]
     ontad: OntadOptions,
 
@@ -72,6 +92,9 @@ pub struct CallTadArgs {
 
     #[command(flatten)]
     arrowhead: ArrowheadOptions,
+
+    #[command(flatten)]
+    hicexplorer: HicexplorerOptions,
 }
 
 /// Options specific to `--method ontad`.
@@ -168,10 +191,6 @@ impl ArmatusOptions {
 /// Options specific to `--method arrowhead`.
 #[derive(Args)]
 struct ArrowheadOptions {
-    /// Normalization to apply (bins column for .cool, norm type for .hic; NONE = raw)
-    #[arg(long, value_name = "NAME", help_heading = "Arrowhead options")]
-    norm: Option<String>,
-
     /// Sliding-window width along the diagonal, in bins
     #[arg(long, value_name = "N", help_heading = "Arrowhead options")]
     window: Option<usize>,
@@ -220,6 +239,84 @@ impl ArrowheadOptions {
     }
 }
 
+/// Options specific to `--method hicexplorer`.
+///
+/// hicFindTADs runs genome-wide by default and takes a *list* of chromosomes,
+/// so `--chromosomes` is the natural selector here; a single `--chr` is
+/// accepted too. The `--threads` value becomes its processor count.
+#[derive(Args)]
+struct HicexplorerOptions {
+    /// Window length (bp) considered to each side of a bin, at minimum
+    #[arg(
+        long = "min-depth",
+        value_name = "BP",
+        help_heading = "hicFindTADs options"
+    )]
+    min_depth: Option<i64>,
+
+    /// Window length (bp) considered to each side of a bin, at maximum
+    #[arg(
+        long = "max-depth",
+        value_name = "BP",
+        help_heading = "hicFindTADs options"
+    )]
+    max_depth: Option<i64>,
+
+    /// First step (bp) between window lengths; later steps grow as
+    /// `step * x**1.5`. (`--step` itself belongs to `--method armatus`.)
+    #[arg(
+        long = "window-step",
+        value_name = "BP",
+        help_heading = "hicFindTADs options"
+    )]
+    window_step: Option<i64>,
+
+    /// Minimum drop of a boundary below the mean score of the bins around it
+    #[arg(
+        long = "delta",
+        value_name = "F",
+        default_value_t = 0.01,
+        help_heading = "hicFindTADs options"
+    )]
+    delta: f64,
+
+    /// Minimum distance between boundaries (bp); defaults to four bins
+    #[arg(
+        long = "min-boundary-distance",
+        value_name = "BP",
+        help_heading = "hicFindTADs options"
+    )]
+    min_boundary_distance: Option<i64>,
+
+    /// Multiple-testing correction
+    #[arg(
+        long = "correct-for-multiple-testing",
+        value_enum,
+        value_name = "METHOD",
+        default_value = "fdr",
+        help_heading = "hicFindTADs options"
+    )]
+    correction: Correction,
+
+    /// p-value (Bonferroni) or q-value (FDR) threshold
+    #[arg(
+        long = "threshold-comparisons",
+        value_name = "F",
+        default_value_t = 0.01,
+        help_heading = "hicFindTADs options"
+    )]
+    threshold_comparisons: f64,
+
+    /// Chromosomes to analyse, in this order
+    #[arg(
+        long = "chromosomes",
+        value_name = "NAME",
+        num_args = 1..,
+        help_heading = "hicFindTADs options"
+    )]
+    chromosomes: Option<Vec<String>>,
+}
+
 pub fn run(args: CallTadArgs) -> cooler_rs::Result<()> {
     let fin = args.input.display().to_string();
 
@@ -228,7 +325,70 @@ pub fn run(args: CallTadArgs) -> cooler_rs::Result<()> {
         TadMethod::Domaincaller => run_domaincaller(&args, &fin),
         TadMethod::Armatus => run_armatus(&args, &fin),
         TadMethod::Arrowhead => run_arrowhead(&args, &fin),
+        TadMethod::Hicexplorer => run_hicexplorer(&args, &fin),
     }
+}
+
+/// `--method hicexplorer`: HiCExplorer's `hicFindTADs`, genome-wide.
+///
+/// Unlike the other methods this one has no single-chromosome path, and it
+/// writes a whole set of files rather than one TAD list, so it takes the
+/// cooler straight from `open_cooler_file` instead of the per-chromosome
+/// offsets the other runners need.
+fn run_hicexplorer(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
+    let cooler = open_cooler_file(args, fin)?;
+    let hx = &args.hicexplorer;
+
+    let params = findtads::Params {
+        min_depth: hx.min_depth,
+        max_depth: hx.max_depth,
+        step: hx.window_step,
+        delta: hx.delta,
+        min_boundary_distance: hx.min_boundary_distance,
+        correction: match hx.correction {
+            Correction::Fdr => MultipleTesting::Fdr,
+            Correction::Bonferroni => MultipleTesting::Bonferroni,
+            Correction::None => MultipleTesting::None,
+        },
+        threshold_comparisons: hx.threshold_comparisons,
+        norm: args.norm.clone(),
+        chromosomes: hx
+            .chromosomes
+            .clone()
+            .or_else(|| args.chr.clone().map(|c| vec![c])),
+        out_prefix: args.output.clone().unwrap_or_else(|| fin.to_string()),
+    };
+
+    log::info!(
+        "hicFindTADs (Rust port): delta={}, correction={:?}, threshold={}, norm={:?}, chromosomes={:?}, threads={}",
+        params.delta,
+        params.correction,
+        params.threshold_comparisons,
+        params.norm,
+        params.chromosomes,
+        args.threads
+    );
+    let t0 = Instant::now();
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build()
+        .map_err(|e| {
+            Error::InvalidInput(format!(
+                "cannot build thread pool with {} threads: {e}",
+                args.threads
+            ))
+        })?;
+    let outputs = pool.install(|| findtads::run_cooler(&cooler, &params))?;
+
+    log::info!(
+        "{} boundaries and {} domains; wrote {} in {:.1}s",
+        outputs.n_boundaries,
+        outputs.n_domains,
+        outputs.tad_score.display(),
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// Resolve the input into a `Cooler` at the requested resolution, without
@@ -582,7 +742,7 @@ fn run_ontad(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
 
 fn run_arrowhead(args: &CallTadArgs, fin: &str) -> cooler_rs::Result<()> {
     let params = args.arrowhead.params();
-    let norm = args.arrowhead.norm.as_deref();
+    let norm = args.norm.as_deref();
     log::info!(
         "Arrowhead (Rust port of juicer): window={}, var={:?}, high_sign={}, min_block_size={}, norm={:?}, threads={}",
         params.matrix_width,
