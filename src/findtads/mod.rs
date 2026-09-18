@@ -278,10 +278,17 @@ pub fn prepare(cooler: &Cooler, params: &Params) -> Result<Prepared> {
     }
 
     let band_limit = depths.band_limit;
-    bands.par_iter_mut().for_each(|band| {
-        band.zscore();
-        band.truncate(band_limit);
-    });
+    // TODO(reproduce-hicexplorer): `zscore` takes the pre-`enlarge_bins`
+    // coordinates because the original derives its distance key from them and
+    // only closes the gaps between masked bins afterwards. This call therefore
+    // has to stay *before* `enlarge_bins`.
+    bands
+        .par_iter_mut()
+        .zip(chrom_bins.par_iter())
+        .for_each(|(band, chrom)| {
+            band.zscore(chrom, binsize);
+            band.truncate(band_limit);
+        });
 
     enlarge_bins(&mut chrom_bins);
 

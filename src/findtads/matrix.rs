@@ -175,34 +175,156 @@ impl Band {
 
     /// `HiCMatrix.convert_to_obs_exp_matrix(zscore=True, perchr=True)`.
     ///
-    /// Each diagonal is standardized by its own mean and standard deviation.
-    /// The original densifies the band first, with a "+1 then -1" sparse
-    /// trick, so that the cells missing from the sparse input join the
-    /// statistics as zeros; summing over the whole diagonal and treating a
-    /// missing cell as `0` gives exactly the same numbers, and it also
-    /// produces the diagonal of `NaN` (mean 0, standard deviation 0) the
+    /// Cells are pooled by the original's distance key and each pool is
+    /// standardized by its own mean and standard deviation. The original
+    /// densifies the band first, with a "+1 then -1" sparse trick, so that the
+    /// cells missing from the sparse input join the statistics as zeros;
+    /// treating a missing cell as `0` gives exactly the same numbers, and it
+    /// also produces the diagonal of `NaN` (mean 0, standard deviation 0) the
     /// original stores for every bin.
     ///
     /// The diagonal itself is zeroed first, as `diagflat(value=0)` does.
-    pub fn zscore(&mut self) {
+    ///
+    /// `bins` must hold the **pre-`enlarge_bins`** coordinates: the distance
+    /// key is derived from them, and the original computes the z-scores before
+    /// it closes the gaps that masking left behind. `binsize` likewise comes
+    /// from `bin_size`, which is resolved before masking.
+    pub fn zscore(&mut self, bins: &ChromBins, binsize: i64) {
         let n = self.size();
+        if self.depth == 0 || n == 0 || binsize <= 0 {
+            return;
+        }
+
+        // TODO(reproduce-hicexplorer): this replicates a quirk of the original
+        // and should be revisited upstream before it is treated as correct.
+        //
+        // `convert_to_obs_exp_matrix` does NOT pool cells by bin offset. Its
+        // distance key comes from `getDistList`, which is the difference of bin
+        // *start coordinates* -- a genomic distance in bp -- bucketed as
+        //
+        //     key = int((start[j] - start[i]) / binsize) + 1
+        //
+        // On a uniform grid that is the bin offset plus one, so the two agree.
+        // They diverge wherever masking removed a bin: the gap is still in the
+        // coordinates at this point, because the original runs
+        // `convert_to_zscore_matrix` *before* `enlarge_bins`. Every pair that
+        // spans a gap therefore gets an inflated key and is pooled with cells
+        // that are genuinely further away. That is why the two implementations
+        // disagree around masked bins -- and, since one gap shifts every pair
+        // spanning it, over most of that chromosome besides.
+        //
+        // Consequence worth flagging upstream: because a cell's pool depends on
+        // which bins happened to be dropped, the result is not a z-score in the
+        // usual sense -- per pool it is not mean 0 / sd 1. Measured on the 40 kb
+        // CNP0007920 leaf matrix the pools came out at mean ~ +0.10..+0.16 and
+        // sd ~ 0.80..0.87, where the exact-offset grouping gives exactly 0
+        // and 1.
+        let key = |i: usize, d: usize| -> usize {
+            let span = bins.start[i + d] - bins.start[i];
+            (span / binsize) as usize + 1
+        };
+
+        // The key is not a function of `d` alone, so pool sizes are not known
+        // up front; find the largest key first and index the pools by it.
+        let mut max_key = 1usize;
+        for d in 1..self.depth {
+            let len = n - d;
+            if len == 0 {
+                break;
+            }
+            for i in 0..len {
+                max_key = max_key.max(key(i, d));
+            }
+        }
+        let n_keys = max_key + 1;
+
+        let mut count = vec![0usize; n_keys];
+        let mut sum = vec![0.0f64; n_keys];
+        for d in 1..self.depth {
+            let len = n - d;
+            if len == 0 {
+                break;
+            }
+            let column = &self.values[d];
+            for (i, &v) in column.iter().enumerate() {
+                let k = key(i, d);
+                count[k] += 1;
+                sum[k] += v;
+            }
+        }
+
+        // `diagonal_length` is the original's pooling denominator: the number
+        // of cells a pool would hold on a regular grid, `n - (key - 1)`, but
+        // never fewer than the cells actually in it,
+        //
+        //     diagonal_length = max(n - (key - 1), count)
+        //
+        // It divides the sum for the mean, and it is the count the standard
+        // deviation averages over -- a cell a pool is missing from
+        // `diagonal_length` contributes as the zero it is.
+        let mut mu = vec![f64::NAN; n_keys];
+        let mut diagonal_length = vec![0usize; n_keys];
+        for k in 1..n_keys {
+            let on_grid = n.saturating_sub(k - 1);
+            let dl = on_grid.max(count[k]);
+            diagonal_length[k] = dl;
+            if dl > 0 {
+                mu[k] = sum[k] / dl as f64;
+            }
+        }
+
+        // The deviations are summed with `np.sum`, which accumulates pairwise,
+        // while the pool sums above come from `np.bincount`, which does not.
+        // Keeping the two orders apart is what makes the last digits match --
+        // see `pairwise_sum`.
+        let mut deviations: Vec<Vec<f64>> = vec![Vec::new(); n_keys];
+        for d in 1..self.depth {
+            let len = n - d;
+            if len == 0 {
+                break;
+            }
+            let column = &self.values[d];
+            for (i, &v) in column.iter().enumerate() {
+                let k = key(i, d);
+                let dev = v - mu[k];
+                deviations[k].push(dev * dev);
+            }
+        }
+        let sq: Vec<f64> = deviations.iter().map(|v| pairwise_sum(v)).collect();
+
+        let mut std = vec![0.0f64; n_keys];
+        for k in 1..n_keys {
+            let dl = diagonal_length[k];
+            if dl == 0 {
+                continue;
+            }
+            let missing = (dl - count[k]) as f64;
+            std[k] = ((sq[k] + missing * mu[k] * mu[k]) / dl as f64).sqrt();
+        }
+
+        // TODO(reproduce-hicexplorer): the original also forces the key `0`
+        // pool to `NaN` (`if maxdepth and bin_dist_plus_one == 0`). Key 0 only
+        // exists for inter-chromosomal cells, which `perchr=True` never puts in
+        // a band, so it is unreachable here and no guard is kept for it.
         for d in 0..self.depth {
             let len = n - d;
             if len == 0 {
                 break;
             }
-            let column = &mut self.values[d];
             if d == 0 {
-                column.iter_mut().for_each(|v| *v = f64::NAN);
+                // `diagflat(value=0)` zeroed the diagonal, so its pool holds
+                // only zeros: mean 0, standard deviation 0, every cell `NaN`.
+                self.values[d].iter_mut().for_each(|v| *v = f64::NAN);
                 continue;
             }
-            let mu = column.iter().sum::<f64>() / len as f64;
-            let deviations: Vec<f64> = column.iter().map(|v| (v - mu) * (v - mu)).collect();
-            let std = (pairwise_sum(&deviations) / len as f64).sqrt();
-            if std == 0.0 {
-                column.iter_mut().for_each(|v| *v = f64::NAN);
-            } else {
-                column.iter_mut().for_each(|v| *v = (*v - mu) / std);
+            let column = &mut self.values[d];
+            for (i, v) in column.iter_mut().enumerate() {
+                let k = key(i, d);
+                *v = if std[k] == 0.0 {
+                    f64::NAN
+                } else {
+                    (*v - mu[k]) / std[k]
+                };
             }
         }
     }
