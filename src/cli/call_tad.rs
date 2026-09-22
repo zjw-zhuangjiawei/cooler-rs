@@ -428,7 +428,7 @@ fn open_cooler_file(args: &CommonArgs, fin: &str) -> cooler_rs::Result<Cooler> {
     } else {
         Err(Error::InvalidInput(
             "input must be a .cool or .mcool file \
-             (use 'cooler-rs convert --from dense-txt' to convert dense text matrices)"
+             (use 'cooler-rs load' to build one from a dense text matrix)"
                 .into(),
         ))
     }

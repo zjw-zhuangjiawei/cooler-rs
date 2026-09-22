@@ -1,7 +1,13 @@
-//! `dump` — write tables out of a `.hic`/`.cool`/`.mcool` file to stdout.
+//! `dump` — write a `.hic`/`.cool`/`.mcool` out as text.
 //!
-//! This is a port of `hictk dump` (`src/hictk/dump/`), sized so the two
-//! outputs can be `diff`ed. The formatting rules below are copied from
+//! `dump pixels` is a port of `hictk dump`'s interaction table, sized so the
+//! two outputs can be `diff`ed. hictk's other tables (`chroms`, `bins`,
+//! `normalizations`, `resolutions`, `weights`) are not implemented: the table
+//! selector and its five renderers were dropped, so `--resolution` /
+//! `-r` / `-b` / `--join` are all that is left of that surface. Adding one
+//! back means a `Table`-like flag again, or a subcommand next to `pixels`.
+//!
+//! The formatting rules below are copied from
 //! `hictk/src/hictk/dump/common.cpp`; the two that are easy to get wrong:
 //!
 //! - pixel counts print with printf `%.16g` — 16 significant digits, `%g`
@@ -12,15 +18,17 @@
 //!   divide agrees to ~15 digits but not to the 16th, so the last printed
 //!   digit differs ([`scale_divisive_f32`]).
 //!
-//! Not ported (yet): `--table cells` (`.scool` only), `--range2`,
-//! `--query-file`, `--cis-only`/`--trans-only`, `--matrix-type`/`--matrix-unit`
-//! (oe/expected/FRAG), `--sorted`/`--unsorted`. Pixels are always emitted in
-//! the ascending order our readers return them in, which is what `hictk dump`
-//! does by default.
+//! `dump matrix` is the one subcommand that is not hictk's: it writes the
+//! whole dense N×N square for one chromosome in the original OnTAD `.mat` text
+//! format. That format — both directions — lives here rather than in
+//! `convert`, which is for Hi-C containers only; `load` reads it back.
+//!
+//! Pixels are always emitted in the ascending order our readers return them
+//! in, which is what `hictk dump` does by default.
 
 use std::io::{self, BufWriter, Write};
 
-use clap::{Args, ValueEnum};
+use clap::{Args, Subcommand};
 
 use cooler_rs::cooler::Cooler;
 use cooler_rs::error::{Error, Result};
@@ -30,59 +38,70 @@ use cooler_rs::mcool::Mcool;
 use cooler_rs::region::Region;
 use cooler_rs::types::{Bin, Chrom, Pixel, WeightType};
 
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Table {
-    /// Chromosome table: `name<TAB>length`
-    Chroms,
-    /// Bin table: `chrom<TAB>start<TAB>end`
-    Bins,
-    /// Interaction table (default): `bin1_id<TAB>bin2_id<TAB>count`
-    Pixels,
-    /// Normalization method names, one per line
-    Normalizations,
-    /// Available resolutions, one per line
-    Resolutions,
-    /// Normalization weights, one column per method
-    Weights,
-}
-
+/// Fields every `dump` mode shares. Split out so the `matrix` subcommand —
+/// which is ours, not hictk's — can carry the same ones without `--join`.
 #[derive(Args)]
-pub struct DumpArgs {
+struct CommonArgs {
     /// Path to a .hic, .cool or .mcool file
-    pub uri: String,
+    #[arg(value_name = "URI")]
+    uri: String,
 
     /// HiC matrix resolution (required for .hic/.mcool with >1 resolution)
     #[arg(long, value_name = "BP")]
-    pub resolution: Option<u32>,
-
-    /// Name of the table to dump
-    #[arg(short = 't', long, value_enum, default_value_t = Table::Pixels)]
-    pub table: Table,
+    resolution: Option<u32>,
 
     /// UCSC-style coordinates of the region to dump (`chr1:0-1000`)
     #[arg(short = 'r', long, default_value = "all")]
-    pub range: String,
+    range: String,
 
     /// Balance interactions using the given method (`.hic` norm vector name,
     /// or a `bins` column for `.cool`/`.mcool`)
     #[arg(short = 'b', long, default_value = "NONE")]
-    pub balance: String,
+    balance: String,
+}
+
+/// One subcommand per mode, both required: an optional subcommand sitting
+/// alongside the positional `uri` is what a flat `dump F` would need, and clap
+/// 4.6.4 does not parse that however the `subcommand_*` settings are combined
+/// (`dump matrix F` always reports `uri` as missing).
+#[derive(Args)]
+pub struct DumpArgs {
+    #[command(subcommand)]
+    command: DumpCommand,
+}
+
+#[derive(Subcommand)]
+enum DumpCommand {
+    /// Interaction table: `bin1_id<TAB>bin2_id<TAB>count`, one row per pixel
+    Pixels(PixelsArgs),
+    /// Dense N×N matrix over one chromosome, whitespace-separated — the
+    /// original OnTAD `.mat` text format, and the inverse of `load`.
+    /// Requires `-r <chrom>`
+    Matrix(MatrixArgs),
+}
+
+#[derive(Args)]
+struct PixelsArgs {
+    #[command(flatten)]
+    common: CommonArgs,
 
     /// Output pixels in BG2 format (chrom/start/end pairs instead of bin ids)
     #[arg(long)]
-    pub join: bool,
+    join: bool,
+}
+
+#[derive(Args)]
+struct MatrixArgs {
+    #[command(flatten)]
+    common: CommonArgs,
 }
 
 pub fn run(args: DumpArgs) -> Result<()> {
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    match args.table {
-        Table::Resolutions => dump_resolutions(&args, &mut out),
-        Table::Normalizations => dump_normalizations(&args, &mut out),
-        Table::Chroms => dump_chroms(&args, &mut out),
-        Table::Bins => dump_bins(&args, &mut out),
-        Table::Weights => dump_weights(&args, &mut out),
-        Table::Pixels => dump_pixels(&args, &mut out),
+    match &args.command {
+        DumpCommand::Pixels(p) => dump_pixels(p, &mut out),
+        DumpCommand::Matrix(m) => dump_matrix(&m.common, &mut out),
     }
 }
 
@@ -134,7 +153,7 @@ enum Input {
     Cool(Cooler),
 }
 
-fn open_input(args: &DumpArgs) -> Result<Input> {
+fn open_input(args: &CommonArgs) -> Result<Input> {
     if let Ok(hic) = HiCFile::open(&args.uri) {
         return Ok(Input::Hic(hic));
     }
@@ -155,7 +174,7 @@ fn resolutions_of(input: &Input) -> Result<Vec<u32>> {
 /// `--resolution` is mandatory for a multi-resolution `.hic`/`.mcool` (hictk
 /// enforces the same, `cli_dump.cpp`:160); a single-resolution file or a plain
 /// `.cool` supplies its own.
-fn resolve_resolution(args: &DumpArgs, input: &Input) -> Result<u32> {
+fn resolve_resolution(args: &CommonArgs, input: &Input) -> Result<u32> {
     if let Some(r) = args.resolution {
         return Ok(r);
     }
@@ -211,78 +230,6 @@ fn bin_ids_for(
 }
 
 // ---------------------------------------------------------------- tables ---
-
-fn dump_resolutions(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
-    let input = open_input(args)?;
-    // `.hic` zoom levels come back finest-last; hictk lists them ascending.
-    let mut res = resolutions_of(&input)?;
-    res.sort_unstable();
-    if let Some(want) = args.resolution {
-        if !res.contains(&want) {
-            return Err(Error::InvalidInput(format!(
-                "file does not have interactions for {want} resolution"
-            )));
-        }
-        res.retain(|r| *r == want);
-    }
-    for r in res {
-        // hictk prints `variable` for the variable-bin-size resolution (0).
-        if r == 0 {
-            writeln!(out, "variable")?;
-        } else {
-            writeln!(out, "{r}")?;
-        }
-    }
-    Ok(())
-}
-
-fn dump_normalizations(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
-    let input = open_input(args)?;
-    let mut names = match &input {
-        Input::Hic(h) => h.avail_normalizations()?,
-        Input::Mcool(m) => {
-            let res = resolve_resolution(args, &input)?;
-            m.cooler(res as u64)?.bins_column_names()?
-        }
-        Input::Cool(c) => c.bins_column_names()?,
-    };
-    names.sort();
-    names.dedup();
-    for n in names {
-        writeln!(out, "{n}")?;
-    }
-    Ok(())
-}
-
-fn dump_chroms(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
-    let input = open_input(args)?;
-    let chroms = match &input {
-        Input::Hic(h) => h.chromosomes(),
-        _ => {
-            let res = resolve_resolution(args, &input)?;
-            File::open(&args.uri, res)?.chroms()?
-        }
-    };
-    let Some(region) = parse_range(&args.range)? else {
-        for c in &chroms {
-            // hictk skips the `ALL` pseudo-chromosome that `.hic` files carry.
-            if c.name != "ALL" {
-                writeln!(out, "{}\t{}", c.name, c.length)?;
-            }
-        }
-        return Ok(());
-    };
-    for c in &chroms {
-        if c.name == region.chrom {
-            writeln!(out, "{}\t{}", c.name, c.length)?;
-            return Ok(());
-        }
-    }
-    Err(Error::InvalidInput(format!(
-        "unknown sequence label: {}",
-        region.chrom
-    )))
-}
 
 /// The chromosomes of `input`, seen at `resolution`.
 fn input_chroms(input: &Input, resolution: u32) -> Result<Vec<Chrom>> {
@@ -357,23 +304,6 @@ fn collect_cis(
     Ok(())
 }
 
-fn dump_bins(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
-    let input = open_input(args)?;
-    let res = resolve_resolution(args, &input)?;
-    let chroms = input_chroms(&input, res)?;
-    let (bins, chrom_offset) = tiled_bins(&chroms, res);
-
-    let (i0, i1) = match parse_range(&args.range)? {
-        None => (0, bins.len() as i64),
-        Some(r) => bin_ids_for(&chrom_offset, &chroms, res, &r)?,
-    };
-    for b in &bins[i0 as usize..i1 as usize] {
-        let chrom = &chroms[b.chrom_id as usize].name;
-        writeln!(out, "{chrom}\t{}\t{}", b.start, b.end)?;
-    }
-    Ok(())
-}
-
 /// Normalization vectors for every chromosome, concatenated into one global
 /// per-bin vector. `.hic` norm vectors are stored per chromosome.
 fn hic_global_weights(hic: &HiCFile, res: u32, name: &str) -> Result<Vec<f64>> {
@@ -388,79 +318,6 @@ fn hic_global_weights(hic: &HiCFile, res: u32, name: &str) -> Result<Vec<f64>> {
         out.extend(w);
     }
     Ok(out)
-}
-
-fn dump_weights(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
-    let input = open_input(args)?;
-    let res = resolve_resolution(args, &input)?;
-    let chroms = input_chroms(&input, res)?;
-    let (bins, chrom_offset) = tiled_bins(&chroms, res);
-
-    let (i0, i1) = match parse_range(&args.range)? {
-        None => (0, bins.len() as i64),
-        Some(r) => bin_ids_for(&chrom_offset, &chroms, res, &r)?,
-    };
-
-    let (names, columns): (Vec<String>, Vec<Vec<f64>>) = match &input {
-        // `.hic` vectors are divisive and are printed as stored.
-        Input::Hic(h) => {
-            let names = h.avail_normalizations()?;
-            let mut columns = Vec::with_capacity(names.len());
-            for n in &names {
-                columns.push(hic_global_weights(h, res, n)?);
-            }
-            (names, columns)
-        }
-        // cooler `bins` columns have no inherent convention, so they are
-        // resolved per column and this table is printed in the DIVISIVE one
-        // whatever the column holds (`src/hictk/dump/common.cpp:88-92`): a
-        // multiplicative `weight` comes out as `1/w`, a divisive `KR` as
-        // stored. Only the `bins` table is read here — unlike the `.hic`
-        // variant, `File` on a cooler never touches the pixels.
-        _ => {
-            let file = File::open(&args.uri, res)?;
-            let mut names = file.avail_normalizations()?;
-            names.sort();
-            names.dedup();
-            let mut columns = Vec::with_capacity(names.len());
-            for n in &names {
-                let w = file_weights(&file, n, bins.len())?;
-                columns.push(if file_weight_type(&file, n).is_divisive() {
-                    w
-                } else {
-                    w.into_iter().map(|v| 1.0 / v).collect()
-                });
-            }
-            (names, columns)
-        }
-    };
-
-    if names.is_empty() {
-        return Ok(());
-    }
-    writeln!(out, "{}", names.join("\t"))?;
-    // hictk joins the formatted row with `\t`, i.e. default (shortest
-    // round-trip) float formatting, not `%.16g`.
-    let mut row = vec![String::new(); names.len()];
-    for i in i0.max(0) as usize..i1 as usize {
-        for (j, col) in columns.iter().enumerate() {
-            row[j] = fmt_short(col[i]);
-        }
-        writeln!(out, "{}", row.join("\t"))?;
-    }
-    Ok(())
-}
-
-/// Shortest round-trip float formatting, with `fmt`'s lower-case NaN/Infinity
-/// spellings (Rust prints `NaN`/`inf`).
-fn fmt_short(x: f64) -> String {
-    if x.is_nan() {
-        return "nan".to_string();
-    }
-    if x.is_infinite() {
-        return if x < 0.0 { "-inf" } else { "inf" }.to_string();
-    }
-    format!("{x}")
 }
 
 fn file_weights(file: &File, name: &str, n_bins: usize) -> Result<Vec<f64>> {
@@ -489,36 +346,17 @@ fn file_weight_type(file: &File, name: &str) -> WeightType {
     }
 }
 
-fn dump_pixels(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
-    let input = open_input(args)?;
-    let res = resolve_resolution(args, &input)?;
+fn dump_pixels(args: &PixelsArgs, out: &mut impl Write) -> Result<()> {
+    let input = open_input(&args.common)?;
+    let res = resolve_resolution(&args.common, &input)?;
     let chroms = input_chroms(&input, res)?;
     let (bins, chrom_offset) = tiled_bins(&chroms, res);
 
     // A region is a cis block: both ends must fall inside it. `File::fetch`
     // is a *row* query (bin2 spans the whole chromosome), so filter here.
-    let (i0, i1) = match parse_range(&args.range)? {
+    let (i0, i1) = match parse_range(&args.common.range)? {
         None => (0i64, bins.len() as i64),
         Some(r) => bin_ids_for(&chrom_offset, &chroms, res, &r)?,
-    };
-
-    // The *precision* depends on the format — `pixel_selector_impl.hpp:141`
-    // divides an f32 by `(float)(w1 * w2)` for `.hic`, while
-    // `weights_impl.hpp:182` divides an f64 by the f64 product — but the
-    // *operation* depends on the column's resolved type, not the container:
-    // a cooler `KR` column is divisive and its `weight` column is not.
-    let is_hic = matches!(input, Input::Hic(_));
-    let balance = match (args.balance != "NONE").then_some(args.balance.as_str()) {
-        None => None,
-        Some(name) => Some(match &input {
-            Input::Hic(h) => (hic_global_weights(h, res, name)?, WeightType::Divisive),
-            _ => {
-                let file = File::open(&args.uri, res)?;
-                let w = file_weights(&file, name, bins.len())?;
-                let t = file_weight_type(&file, name);
-                (w, t)
-            }
-        }),
     };
 
     // Read streamed (`File::pixels` used to materialize and sort the whole
@@ -533,18 +371,7 @@ fn dump_pixels(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
     let mut pixels = Vec::new();
     collect_cis(&input, res, i0, i1, &mut pixels)?;
     pixels.sort_unstable_by_key(|p| (p.bin1_id, p.bin2_id));
-    if let Some((w, wtype)) = &balance {
-        for p in &mut pixels {
-            let (a, b) = (p.bin1_id as usize, p.bin2_id as usize);
-            p.count = if is_hic {
-                scale_divisive_f32(p.count, w[a], w[b])
-            } else if wtype.is_divisive() {
-                p.count / (w[a] * w[b])
-            } else {
-                p.count * (w[a] * w[b])
-            };
-        }
-    }
+    apply_balance(&mut pixels, &args.common, &input, res, &bins)?;
 
     for p in &pixels {
         if args.join {
@@ -567,6 +394,151 @@ fn dump_pixels(args: &DumpArgs, out: &mut impl Write) -> Result<()> {
     }
     Ok(())
 }
+
+/// Apply `--balance` to `pixels` in place; a no-op for the default `NONE`.
+///
+/// The *precision* depends on the format — `pixel_selector_impl.hpp:141`
+/// divides an f32 by `(float)(w1 * w2)` for `.hic`, while
+/// `weights_impl.hpp:182` divides an f64 by the f64 product — but the
+/// *operation* depends on the column's resolved type, not the container: a
+/// cooler `KR` column is divisive and its `weight` column is not.
+fn apply_balance(
+    pixels: &mut [Pixel],
+    args: &CommonArgs,
+    input: &Input,
+    res: u32,
+    bins: &[Bin],
+) -> Result<()> {
+    if args.balance == "NONE" {
+        return Ok(());
+    }
+    let is_hic = matches!(input, Input::Hic(_));
+    let (w, wtype) = match input {
+        Input::Hic(h) => (
+            hic_global_weights(h, res, &args.balance)?,
+            WeightType::Divisive,
+        ),
+        _ => {
+            let file = File::open(&args.uri, res)?;
+            let w = file_weights(&file, &args.balance, bins.len())?;
+            let t = file_weight_type(&file, &args.balance);
+            (w, t)
+        }
+    };
+    for p in pixels.iter_mut() {
+        let (a, b) = (p.bin1_id as usize, p.bin2_id as usize);
+        p.count = if is_hic {
+            scale_divisive_f32(p.count, w[a], w[b])
+        } else if wtype.is_divisive() {
+            p.count / (w[a] * w[b])
+        } else {
+            p.count * (w[a] * w[b])
+        };
+    }
+    Ok(())
+}
+
+/// Parse a dense N×N whitespace-separated text matrix into sparse pixels.
+///
+/// Only upper-triangle non-zero entries are kept (symmetric-upper sparse
+/// storage); zeros are implicit and omitted. Returns the matrix dimension
+/// `n` together with the pixels, in row-major order.
+///
+/// This is the original OnTAD `.mat` text format, the inverse of
+/// [`dump_matrix`]. `load` is what calls it.
+pub(crate) fn dense_txt_to_pixels(text: &str) -> Result<(usize, Vec<Pixel>)> {
+    let mut pixels: Vec<Pixel> = Vec::new();
+    let mut width: Option<usize> = None;
+
+    // Blank lines are skipped; only non-blank lines count as matrix rows.
+    let mut i = 0;
+    for (lineno, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut cols = 0;
+        for (j, field) in line.split_whitespace().enumerate() {
+            let v: f64 = field.parse().map_err(|_| {
+                Error::InvalidInput(format!(
+                    "line {}, column {}: '{field}' is not a number",
+                    lineno + 1,
+                    j + 1
+                ))
+            })?;
+            if j >= i && v > 0.0 {
+                pixels.push(Pixel {
+                    bin1_id: i as i64,
+                    bin2_id: j as i64,
+                    count: v,
+                });
+            }
+            cols += 1;
+        }
+        match width {
+            None => width = Some(cols),
+            Some(w) if w != cols => {
+                return Err(Error::InvalidInput(format!(
+                    "input is not a square N×N matrix: line {} has {cols} columns, expected {w}",
+                    lineno + 1
+                )));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let n = width.unwrap_or(0);
+    if n == 0 {
+        return Err(Error::InvalidInput("input is empty".into()));
+    }
+    Ok((n, pixels))
+}
+
+/// Dense N×N matrix over one chromosome, one whitespace-separated row per
+/// line — the original OnTAD `.mat` text format, and the inverse of `load`.
+///
+/// Only the upper triangle is stored, so the output is mirrored to fill the
+/// whole square: the format OnTAD reads is symmetric, not triangular.
+///
+/// ponytail: the square is held in RAM (8·N² bytes; 19 MB for a 1534-bin
+/// chromosome, GBs at 1 kb on a large chromosome). Streaming it would mean
+/// re-reading the pixels once per row. `-r` bounds it to a region.
+fn dump_matrix(args: &CommonArgs, out: &mut impl Write) -> Result<()> {
+    let input = open_input(args)?;
+    let res = resolve_resolution(args, &input)?;
+    let chroms = input_chroms(&input, res)?;
+    let (bins, chrom_offset) = tiled_bins(&chroms, res);
+
+    // A dense N×N square is per-chromosome by construction; "all" has no shape.
+    let Some(region) = parse_range(&args.range)? else {
+        return Err(Error::InvalidInput(
+            "-t matrix covers one chromosome: pass -r <chrom>".into(),
+        ));
+    };
+    let (i0, i1) = bin_ids_for(&chrom_offset, &chroms, res, &region)?;
+    let n = (i1 - i0) as usize;
+
+    let mut pixels = Vec::new();
+    collect_cis(&input, res, i0, i1, &mut pixels)?;
+    apply_balance(&mut pixels, args, &input, res, &bins)?;
+
+    let mut m = vec![0.0f64; n * n];
+    for p in &pixels {
+        let (a, b) = ((p.bin1_id - i0) as usize, (p.bin2_id - i0) as usize);
+        m[a * n + b] = p.count;
+        m[b * n + a] = p.count;
+    }
+
+    let mut row = vec![String::new(); n];
+    for r in 0..n {
+        for (c, cell) in row.iter_mut().enumerate() {
+            *cell = g16(m[r * n + c]);
+        }
+        writeln!(out, "{}", row.join("\t"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     // The sub-f64-precision literal below is the point of the case.
@@ -620,5 +592,90 @@ mod tests {
 
         let (w1, w2) = (1.3004152366749544, 1.3004152366749544);
         assert_eq!(g16(scale_divisive_f32(5225.0, w1, w2)), "3089.741943359375");
+    }
+
+    // Moved here from `cooler_rs::convert` with `dense_txt_to_pixels`: the
+    // OnTAD `.mat` text format belongs to `dump`/`load`, not to container
+    // conversion.
+
+    #[test]
+    fn keeps_only_upper_triangle_nonzero() {
+        // Lower triangle and zeros are dropped; values are kept exactly.
+        let (n, pixels) = dense_txt_to_pixels("1 0 2\n3 4 5\n6 0 7\n").unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(
+            pixels,
+            vec![
+                Pixel {
+                    bin1_id: 0,
+                    bin2_id: 0,
+                    count: 1.0
+                },
+                Pixel {
+                    bin1_id: 0,
+                    bin2_id: 2,
+                    count: 2.0
+                },
+                Pixel {
+                    bin1_id: 1,
+                    bin2_id: 1,
+                    count: 4.0
+                },
+                Pixel {
+                    bin1_id: 1,
+                    bin2_id: 2,
+                    count: 5.0
+                },
+                Pixel {
+                    bin1_id: 2,
+                    bin2_id: 2,
+                    count: 7.0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_blank_lines() {
+        let (n, pixels) = dense_txt_to_pixels("1 2\n\n3 4\n").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            pixels,
+            vec![
+                Pixel {
+                    bin1_id: 0,
+                    bin2_id: 0,
+                    count: 1.0
+                },
+                Pixel {
+                    bin1_id: 0,
+                    bin2_id: 1,
+                    count: 2.0
+                },
+                Pixel {
+                    bin1_id: 1,
+                    bin2_id: 1,
+                    count: 4.0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_non_square_matrix() {
+        let err = dense_txt_to_pixels("1 2 3\n4 5\n").unwrap_err();
+        assert!(err.to_string().contains("not a square"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_numeric_entry() {
+        let err = dense_txt_to_pixels("1 2\n3 x\n").unwrap_err();
+        assert!(err.to_string().contains("'x' is not a number"), "{err}");
+    }
+
+    #[test]
+    fn rejects_empty_input() {
+        let err = dense_txt_to_pixels("  \n\n").unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
     }
 }

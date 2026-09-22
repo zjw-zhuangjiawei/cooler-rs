@@ -4,7 +4,8 @@
 //!   `call-tad`  call TADs from a .cool/.mcool contact matrix, one
 //!               subcommand per algorithm
 //!   `compare`   compare multiple matrices and plot a correlation heatmap
-//!   `convert`   convert other matrix formats to/from cooler format
+//!   `convert`   convert between Hi-C container formats (.cool/.mcool -> .hic)
+//!   `load`      build a .cool from an external text format
 //!   `normalize` normalize a contact matrix (ic or raichu)
 //!   `validate`  check a .cool/.mcool file for internal consistency
 //!   `zoomify`   coarsen a single-resolution .cool into a multi-resolution .mcool
@@ -30,10 +31,12 @@ enum Commands {
     CallTad(Box<cli::call_tad::CallTadArgs>),
     /// Compare multiple contact matrices and plot a correlation heatmap
     Compare(cli::compare::CompareArgs),
-    /// Convert other matrix formats to/from cooler format
+    /// Convert between Hi-C container formats
     Convert(cli::convert::ConvertArgs),
-    /// Write tables from a .hic/.cool/.mcool file to stdout
+    /// Write a .hic/.cool/.mcool out as text (pixels or a dense matrix)
     Dump(cli::dump::DumpArgs),
+    /// Build a .cool from an external text format
+    Load(cli::load::LoadArgs),
     /// Normalize a contact matrix (iterative correction or Raichu)
     Normalize(cli::normalize::NormalizeArgs),
     /// Check a .cool/.mcool file for internal consistency
@@ -53,6 +56,7 @@ fn main() {
         Commands::Compare(args) => cli::compare::run(args),
         Commands::Convert(args) => cli::convert::run(args),
         Commands::Dump(args) => cli::dump::run(args),
+        Commands::Load(args) => cli::load::run(args),
         Commands::Normalize(args) => cli::normalize::run(args),
         Commands::Validate(args) => cli::validate::run(args),
         Commands::Zoomify(args) => cli::zoomify::run(args),
