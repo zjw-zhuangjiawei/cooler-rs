@@ -12,8 +12,6 @@
 //! Chromosomes use non-divisible lengths (`chr1` 250_000, `chr2` 100_000) to
 //! exercise the ceil/partial-bin path at both resolutions.
 
-mod common;
-
 use cooler_rs::{
     convert::cooler_to_hic, write_bins_column, Chrom, Cooler, CoolerWriter, HiCFile, Mcool,
     McoolWriter, Pixel,

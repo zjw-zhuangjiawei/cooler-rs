@@ -2,8 +2,6 @@
 //! Read-only `.hic` reader tests against `tests/data/4DNFIOTPSS3L.hic`
 //! (Drosophila, v8). Skipped when the file is absent (it is gitignored).
 
-mod common;
-
 use std::path::Path;
 
 use cooler_rs::{Chrom, File, HiCFile, HicWriter, Pixel, Region};

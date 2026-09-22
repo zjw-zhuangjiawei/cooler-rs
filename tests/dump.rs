@@ -21,8 +21,6 @@
 //! alphabetically sorted header, and ascending resolution order despite `.hic`
 //! storing zoom levels finest-last.
 
-mod common;
-
 use std::path::Path;
 use std::process::Command;
 
