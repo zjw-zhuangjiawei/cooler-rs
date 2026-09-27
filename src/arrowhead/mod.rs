@@ -419,26 +419,33 @@ pub fn call_domains(
     Ok(per_chrom?.into_iter().flatten().collect())
 }
 
-/// Java's narrowing `(int)` conversion of a double: NaN to 0, saturating.
-fn java_double_to_int(x: f64) -> i32 {
-    if x.is_nan() {
-        0
-    } else if x >= i32::MAX as f64 {
-        i32::MAX
-    } else if x <= i32::MIN as f64 {
-        i32::MIN
-    } else {
-        x as i32
-    }
+/// `Double.hashCode` (the low 32 bits of the bit pattern XOR the high
+/// 32): Java boxes each double, so `Objects.hash` folds this in per element.
+fn java_double_hashcode(x: f64) -> i32 {
+    let bits = x.to_bits();
+    ((bits ^ (bits >> 32)) & 0xffff_ffff) as i32
 }
 
-/// `HighScore.hashCode` as juicer 1.22.01 defines it, spread the way
-/// `HashMap.hash` does (`h ^ (h >>> 16)`), so the bucket index matches Java's.
+/// `HighScore.hashCode` as juicer 2.20.00 defines it:
+/// `Objects.hash(i, j, score, uVar, lVar, upSign, loSign)` — i.e.
+/// `Arrays.hashCode` over `[i, j, score, uVar, lVar, upSign, loSign]`
+/// (Integer hash = value, Double hash = [`java_double_hashcode`]),
+/// spread the way `HashMap.hash` does (`h ^ (h >>> 16)`), so the bucket
+/// index matches Java's. (1.22.01 hashed `7 * (i+j) * floor(sum)` instead;
+/// the order change below flips HashSet iteration order.)
 fn java_hash(s: &HighScore) -> u32 {
-    let floor = (s.score + s.u_var + s.l_var + s.up_sign + s.lo_sign).floor();
-    let h = 7i32
-        .wrapping_mul((s.i as i32).wrapping_add(s.j as i32))
-        .wrapping_mul(java_double_to_int(floor));
+    let mut h: i32 = 1;
+    for v in [
+        s.i as i32,
+        s.j as i32,
+        java_double_hashcode(s.score),
+        java_double_hashcode(s.u_var),
+        java_double_hashcode(s.l_var),
+        java_double_hashcode(s.up_sign),
+        java_double_hashcode(s.lo_sign),
+    ] {
+        h = h.wrapping_mul(31).wrapping_add(v);
+    }
     (h ^ ((h as u32) >> 16) as i32) as u32
 }
 
@@ -630,9 +637,10 @@ mod tests {
     #[test]
     fn java_hashset_order_matches_the_jvm() {
         // The expected order is what `new java.util.HashSet<>(list)` iterates
-        // under juicer 1.22.01's HighScore.hashCode, printed by running the real
-        // jar classes over exactly this list. The last two entries duplicate
-        // earlier ones (indices 0 and 13) and are dropped.
+        // under juicer 2.20.00's HighScore.hashCode (Objects.hash of all
+        // seven fields), printed by running the real jar's classes over
+        // exactly this list. Two entries duplicate earlier ones (indices 2
+        // and 20) and are dropped.
         let rows: &[(i64, i64, f64, f64, f64, f64, f64)] = &[
             (0, 5, 0.9843, 0.2441, 0.3187, 0.6445, 0.7500),
             (2, 9, 0.1100, 0.2200, 0.3300, 0.4400, 0.5500),
@@ -674,7 +682,7 @@ mod tests {
 
         assert_eq!(
             java_hashset_order(&items),
-            [17, 21, 16, 6, 22, 0, 13, 8, 4, 5, 1, 14, 19, 3, 11, 15, 7, 10, 18, 12, 23, 9]
+            [3, 7, 6, 11, 4, 16, 9, 12, 18, 1, 21, 14, 23, 10, 5, 15, 22, 0, 8, 13, 17, 19]
         );
     }
 
