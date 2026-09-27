@@ -258,11 +258,22 @@ impl File {
                                 region.chrom, h.resolution
                             ))
                         })?;
-                    for p in &mut pixels {
+                    // juicer's `DatasetReaderV2.readNormalizedBlock`:
+                    // `float counts = (float) (raw / (w_i * w_j))`, with NaN
+                    // results dropped. The normalized counts are float in
+                    // Java, so the f32 rounding is part of the observable
+                    // behavior (borderline scores flip without it).
+                    let mut out = Vec::with_capacity(pixels.len());
+                    for mut p in pixels {
                         let li = (p.bin1_id - g0) as usize;
                         let lj = (p.bin2_id - g0) as usize;
-                        p.count /= w[li] * w[lj];
+                        let v = (p.count / (w[li] * w[lj])) as f32;
+                        if !v.is_nan() {
+                            p.count = v as f64;
+                            out.push(p);
+                        }
                     }
+                    pixels = out;
                 }
                 Ok(pixels)
             }
