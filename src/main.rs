@@ -35,6 +35,8 @@ enum Commands {
     Convert(cli::convert::ConvertArgs),
     /// Write a .hic/.cool/.mcool out as text (pixels or a dense matrix)
     Dump(cli::dump::DumpArgs),
+    /// Call hierarchical domains genome-wide (TADLib hitad port)
+    Hitad(cli::hitad::HitadArgs),
     /// Build a .cool from an external text format
     Load(cli::load::LoadArgs),
     /// Normalize a contact matrix (iterative correction or Raichu)
@@ -56,6 +58,7 @@ fn main() {
         Commands::Compare(args) => cli::compare::run(args),
         Commands::Convert(args) => cli::convert::run(args),
         Commands::Dump(args) => cli::dump::run(args),
+        Commands::Hitad(args) => cli::hitad::run(args),
         Commands::Load(args) => cli::load::run(args),
         Commands::Normalize(args) => cli::normalize::run(args),
         Commands::Validate(args) => cli::validate::run(args),

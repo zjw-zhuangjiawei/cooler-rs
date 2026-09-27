@@ -47,6 +47,7 @@ pub mod error;
 pub mod file;
 pub mod findtads;
 pub mod hic;
+pub mod hitad;
 pub mod mcool;
 pub mod ontad;
 pub mod raichu;

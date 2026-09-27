@@ -14,5 +14,8 @@
 
 pub mod aligner;
 pub mod chrom;
+pub mod genome;
+
+pub use genome::Genome;
 
 pub use chrom::Chrom;

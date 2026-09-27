@@ -80,7 +80,7 @@ impl BoundSet {
 }
 
 /// Assign nesting levels to a list of (chrom, start, end) domains.
-fn hier_format(domainlist: &[Region]) -> Vec<Domain> {
+pub(crate) fn hier_format(domainlist: &[Region]) -> Vec<Domain> {
     let mut bychroms: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
     let mut hierlabel: BTreeMap<&str, BTreeMap<(usize, usize), usize>> = BTreeMap::new();
     for (chrom, start, end) in domainlist {
