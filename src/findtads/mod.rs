@@ -245,6 +245,20 @@ pub fn prepare(cooler: &Cooler, params: &Params) -> Result<Prepared> {
         .map(|c| Band::new(c.len(), depths.zscore_depth))
         .collect();
 
+    // Duplicates in the pixel table are merged by the sparse-matrix
+    // construction before the weights are applied: `csr_matrix((data, ...))`
+    // sums them in the raw count dtype, exactly, and only then does
+    // `cool.py` scale the data by `w_i * w_j`. The 4DN mcool actually carries
+    // 190 duplicated pairs at 5 kb, so scale the accumulated raw counts per
+    // cell, not pixel by pixel. `bin_id` of every kept bin, per chromosome,
+    // for that pass:
+    let mut bin_ids: Vec<Vec<u32>> = vec![Vec::new(); chrom_bins.len()];
+    for (bin_id, slot) in slot_of.iter().enumerate() {
+        if let Some((slot, _)) = slot {
+            bin_ids[*slot].push(bin_id as u32);
+        }
+    }
+
     // Only the band survives, and that is a small fraction of the pixel
     // table, so read it in chunks rather than materializing every pixel of
     // the matrix at once.
@@ -265,16 +279,20 @@ pub fn prepare(cooler: &Cooler, params: &Params) -> Result<Prepared> {
                 continue; // `diagflat(value=0)` zeroes the diagonal
             }
             if d < depths.zscore_depth {
-                let count = match weights.as_deref() {
-                    Some(w) => {
-                        let (wa, wb) = (w[pixel.bin1_id as usize], w[pixel.bin2_id as usize]);
-                        pixel.count * wa * wb
-                    }
-                    None => pixel.count,
-                };
-                bands[slot_a].set(a, d, count);
+                bands[slot_a].set(a, d, pixel.count);
             }
         }
+    }
+
+    if let Some(w) = weights.as_deref() {
+        for (band, ids) in bands.iter_mut().zip(&bin_ids) {
+            band.apply_weights(w, ids);
+        }
+    }
+    // The dense-banding trick of `convert_to_obs_exp_matrix` runs regardless
+    // of weights, and its `+1` / `-1` round trip is not exact.
+    for band in bands.iter_mut() {
+        band.roundtrip_ones();
     }
 
     let band_limit = depths.band_limit;

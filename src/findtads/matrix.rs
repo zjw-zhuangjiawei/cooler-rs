@@ -152,9 +152,46 @@ impl Band {
     }
 
     /// Set the cell at bin distance `d` starting from bin `i`.
+    /// Add `value` to the cell at `(i, i + d)`.
+    ///
+    /// Addition, not assignment: duplicate pixels are legal in a cooler's
+    /// pixel table as far as `cooler`'s own readers are concerned -- the
+    /// sparse-matrix conversion merges them by summing, and the 4DN mcool
+    /// actually carries 190 duplicated pairs at 5 kb. The band starts at
+    /// zero, so the first write is the assignment it replaces.
     pub fn set(&mut self, i: usize, d: usize, value: f64) {
         if d < self.depth && i + d < self.size() {
-            self.values[d][i] = value;
+            self.values[d][i] += value;
+        }
+    }
+
+    /// Scale every cell by `w_i * w_j`, the way `cool.py` applies a weight
+    /// column (`matrix.data *= w_row * w_col`), after the duplicates were
+    /// merged by the sparse-matrix construction.
+    pub fn apply_weights(&mut self, weights: &[f64], bin_ids: &[u32]) {
+        for d in 1..self.depth {
+            for (i, v) in self.values[d].iter_mut().enumerate() {
+                let (wa, wb) = (
+                    weights[bin_ids[i] as usize],
+                    weights[bin_ids[i + d] as usize],
+                );
+                *v *= wa * wb;
+            }
+        }
+    }
+
+    /// Replicate the `+= diag_mat_ones` / `data -= 1` round trip of
+    /// `convert_to_obs_exp_matrix`: the original turns the sparse band dense
+    /// by adding 1 to every cell up to `depth` diagonals and subtracting it
+    /// again after the `tocoo()`. `(v + 1) - 1` is not exact in floating point
+    /// -- it shifts a value around 0.1 by up to an ulp -- and the pool
+    /// statistics sum the round-tripped values, so the band has to carry
+    /// them.
+    pub fn roundtrip_ones(&mut self) {
+        for d in 1..self.depth {
+            for v in self.values[d].iter_mut() {
+                *v = (*v + 1.0) - 1.0;
+            }
         }
     }
 
@@ -238,18 +275,19 @@ impl Band {
         }
         let n_keys = max_key + 1;
 
+        // `np.bincount` accumulates in array order, and the array is the
+        // row-major COO of the dense band (`submatrix.tocoo()`), so the cells
+        // of a pool are visited by row and then column. A pool that spans
+        // masked gaps holds several diagonals, and only this order keeps the
+        // per-pool addition sequence -- a diagonal-major walk sums the same
+        // values in a different order and drifts in the last digits.
         let mut count = vec![0usize; n_keys];
         let mut sum = vec![0.0f64; n_keys];
-        for d in 1..self.depth {
-            let len = n - d;
-            if len == 0 {
-                break;
-            }
-            let column = &self.values[d];
-            for (i, &v) in column.iter().enumerate() {
+        for i in 0..n {
+            for d in 1..self.depth.min(n - i) {
                 let k = key(i, d);
                 count[k] += 1;
-                sum[k] += v;
+                sum[k] += self.values[d][i];
             }
         }
 
@@ -277,16 +315,13 @@ impl Band {
         // while the pool sums above come from `np.bincount`, which does not.
         // Keeping the two orders apart is what makes the last digits match --
         // see `pairwise_sum`.
+        // Row-major, like the pool sums above: the masked subset
+        // `submatrix.data[dist_list == k]` keeps the COO order.
         let mut deviations: Vec<Vec<f64>> = vec![Vec::new(); n_keys];
-        for d in 1..self.depth {
-            let len = n - d;
-            if len == 0 {
-                break;
-            }
-            let column = &self.values[d];
-            for (i, &v) in column.iter().enumerate() {
+        for i in 0..n {
+            for d in 1..self.depth.min(n - i) {
                 let k = key(i, d);
-                let dev = v - mu[k];
+                let dev = self.values[d][i] - mu[k];
                 deviations[k].push(dev * dev);
             }
         }
